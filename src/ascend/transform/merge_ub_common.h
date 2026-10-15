@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
@@ -34,11 +35,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "onchip_memory_limits.h"
 #include "op/builtin.h"
 #include "runtime/thread_storage_scope.h"
 #include "support/check.h"
@@ -95,6 +98,21 @@ inline int64_t PackedBytesFromElems(int64_t elements, int elem_bits) {
                               : (elements * elem_bits + 7) / 8;
 }
 
+/*! \brief Human-readable name of an on-chip scope, or nullptr if unknown. */
+inline const char *OnChipScopeDisplayName(const std::string &scope) {
+  if (scope == "shared" || scope == "shared.dyn")
+    return "Unified Buffer (UB)";
+  if (scope == "shared.l1")
+    return "L1";
+  if (scope == "shared.l0c")
+    return "L0C";
+  if (scope == "shared.l0a")
+    return "L0A";
+  if (scope == "shared.l0b")
+    return "L0B";
+  return nullptr;
+}
+
 inline PrimExpr PackedBytesFromElems(PrimExpr elements, int elem_bits) {
   if (elem_bits % 8 == 0)
     return elements * tirx::make_const(elements.dtype(), elem_bits / 8);
@@ -140,6 +158,128 @@ inline PrimExpr GetBufferSizeBytes(const tirx::AllocBufferNode *alloc,
   if (size_bytes.dtype() != result_dtype)
     size_bytes = cast(result_dtype, size_bytes);
   return size_bytes;
+}
+
+/*!
+ * \brief Footprint of a scope that builds no arena (a single allocation).
+ *
+ * A lone allocation sits at base 0, which satisfies any alignment requirement,
+ * so the packed byte size is the whole physical requirement.
+ */
+inline PrimExpr
+SingleAllocationFootprintBytes(const AllocationMap &allocations) {
+  ICHECK_EQ(allocations.size(), 1U)
+      << "SingleAllocationFootprintBytes expects exactly one allocation";
+  return GetBufferSizeBytes(allocations.begin()->second, DataType::Int(64));
+}
+
+/*!
+ * \brief Bytes the constant-sized allocations of one scope claim, at least.
+ *
+ * Buffer extents are non-negative, so constant-sized allocations already claim
+ * their packed size in every instantiation of the plan, whatever the symbolic
+ * ones turn out to be. This is the floor a symbolic plan total can always be
+ * failed on: the arithmetic analyzer does not assume bare variables are
+ * non-negative, so it often cannot bound such a total on its own.
+ */
+inline PrimExpr ConstantAllocationsBytes(const AllocationMap &allocations) {
+  PrimExpr total = tirx::make_const(DataType::Int(64), 0);
+  for (const auto &[var, alloc] : allocations) {
+    if (GetRef<tirx::AllocBuffer>(alloc).ConstantAllocationSize().has_value())
+      total = total + GetBufferSizeBytes(alloc, DataType::Int(64));
+  }
+  return total;
+}
+
+/*!
+ * \brief Fail when the planned footprint of one scope exceeds its capacity.
+ *
+ * \param scope_key the storage scope the footprint belongs to.
+ * \param footprint planned bytes for the scope (arena total, or the footprint
+ *                  of its lone allocation). May be a symbolic expression.
+ * \param allocations the scope's allocations; their constant-sized subset is
+ *                    the floor a symbolic footprint is also judged on.
+ * \param capacity physical capacity in bytes; <= 0 disables the check (no
+ *                 target attribute, non-Ascend target, or unknown scope).
+ *
+ * Only a provable overflow fails: a constant footprint is compared directly, a
+ * symbolic one only when the analyzer can prove that it -- or the
+ * constant-sized allocations it can never fall below -- exceeds the capacity.
+ * An unprovable symbolic footprint is reported as a warning and merged
+ * normally, since a hard error would reject kernels that may well fit once
+ * their shapes are instantiated.
+ */
+inline void CheckOnChipCapacity(const std::string &scope_key,
+                                const PrimExpr &footprint,
+                                const AllocationMap &allocations,
+                                int64_t capacity) {
+  if (capacity <= 0 || !footprint.defined())
+    return;
+
+  arith::Analyzer analyzer;
+  PrimExpr simplified = analyzer.Simplify(footprint);
+  const auto *constant = simplified.as<IntImmNode>();
+  PrimExpr bound = simplified;
+  bool overflows;
+  if (constant != nullptr) {
+    overflows = constant->value > capacity;
+  } else {
+    overflows = analyzer.CanProve(
+        simplified > tirx::make_const(simplified.dtype(), capacity));
+    if (!overflows) {
+      PrimExpr floor_bytes =
+          analyzer.Simplify(ConstantAllocationsBytes(allocations));
+      const auto *floor_constant = floor_bytes.as<IntImmNode>();
+      if (floor_constant != nullptr && floor_constant->value > capacity) {
+        overflows = true;
+        bound = floor_bytes; // the proven floor, not the whole expression
+      }
+    }
+  }
+  if (!overflows) {
+    if (constant == nullptr) {
+      LOG(WARNING) << "MergeUBAllocations: the planned footprint of scope \""
+                   << scope_key << "\" is symbolic (" << simplified
+                   << " bytes) and cannot be proven to fit "
+                   << "the " << capacity
+                   << "-byte physical capacity, so the overflow check is "
+                      "skipped for this "
+                   << "scope. Constant shapes (e.g. an explicit T.dynamic "
+                      "bound) let it be checked.";
+    }
+    return;
+  }
+
+  // One shared message: only the "needs X" clause differs between a concrete
+  // overflow and a provable lower bound.
+  const char *display = OnChipScopeDisplayName(scope_key);
+  std::ostringstream overflow;
+  overflow
+      << "MergeUBAllocations: on-chip memory overflow: the plan for scope \""
+      << scope_key << "\""
+      << (display ? std::string(" (") + display + ")" : "");
+  if (constant != nullptr) {
+    double percent = 100.0 * static_cast<double>(constant->value) /
+                     static_cast<double>(capacity);
+    overflow << " needs " << constant->value
+             << " bytes but the device capacity is " << capacity << " bytes ("
+             << percent << "%).";
+  } else {
+    overflow << " is provably at least ";
+    if (const auto *bound_constant = bound.as<IntImmNode>()) {
+      overflow << bound_constant->value;
+    } else {
+      overflow << bound;
+    }
+    overflow << " bytes but the device capacity is " << capacity << " bytes.";
+  }
+  LOG(FATAL)
+      << overflow.str()
+      << " Reduce the buffers resident in this scope: use smaller tiles, "
+      << "fewer buffer versions or software-pipeline stages, or fewer "
+      << "simultaneously live operands. Note: T.annotate_unlimit_memory "
+      << "only lifts the scheduling budget; it cannot waive the physical "
+      << "on-chip capacity, so it will not make this kernel fit.";
 }
 
 class AllocateCollector : public tirx::StmtExprVisitor {
@@ -231,6 +371,10 @@ public:
     for (const auto &[var, offset] : buffer_byte_offsets_)
       LOG(DEBUG) << "    Buffer " << var->name_hint << " offset=" << offset;
   }
+
+  /*! \brief Planned byte size of the merged arena, i.e. what codegen allocates.
+   */
+  const PrimExpr &MergedSize() const { return merged_alloc_size_; }
 
 private:
   tirx::Stmt VisitStmt_(const tirx::AttrStmtNode *op) final {
@@ -408,26 +552,40 @@ private:
 
 template <typename Planner>
 tirx::Stmt MergeAllocations(tirx::Stmt stmt, int align_bytes, bool verbose,
-                            bool disable_reuse, const Planner &planner) {
+                            bool disable_reuse, const Planner &planner,
+                            const ascend::OnChipLimits &limits) {
   AllocateCollector collector;
   collector(stmt);
-  auto run = [&](SharedMemoryRewriter &rewriter,
-                 const AllocationMap &allocations,
-                 const AllocationOrder &allocation_order,
-                 const std::string &target_scope) {
-    if (disable_reuse) {
-      rewriter.PlanNoReuse();
-    } else {
-      rewriter.SetPlan(planner(stmt, allocations, allocation_order,
-                               target_scope, align_bytes, verbose));
-    }
-    stmt = rewriter(std::move(stmt));
-  };
+  auto run =
+      [&](SharedMemoryRewriter &rewriter, const AllocationMap &allocations,
+          const AllocationOrder &allocation_order,
+          const std::string &target_scope, const std::string &scope_key) {
+        if (disable_reuse) {
+          rewriter.PlanNoReuse();
+        } else {
+          rewriter.SetPlan(planner(stmt, allocations, allocation_order,
+                                   target_scope, align_bytes, verbose));
+        }
+        // The merged size IS the merged buffer's shape, i.e. exactly what
+        // codegen will allocate for this scope, so validate it against the
+        // physical capacity before the rewrite lands. Covers both the alias
+        // plan and the sequential PlanNoReuse plan.
+        CheckOnChipCapacity(scope_key, rewriter.MergedSize(), allocations,
+                            limits.ForScope(scope_key));
+        stmt = rewriter(std::move(stmt));
+      };
 
   if (collector.dyn_shmem_allocs.size() > 1) {
     SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs, verbose,
                                   align_bytes);
-    run(rewriter, collector.dyn_shmem_allocs, collector.dyn_shmem_order, "");
+    run(rewriter, collector.dyn_shmem_allocs, collector.dyn_shmem_order, "",
+        "shared.dyn");
+  } else if (collector.dyn_shmem_allocs.size() == 1) {
+    // A lone UB allocation builds no arena, so it never reaches `run` above.
+    CheckOnChipCapacity(
+        "shared.dyn",
+        SingleAllocationFootprintBytes(collector.dyn_shmem_allocs),
+        collector.dyn_shmem_allocs, limits.ForScope("shared.dyn"));
   }
 
   std::vector<std::string> scopes;
@@ -437,8 +595,13 @@ tirx::Stmt MergeAllocations(tirx::Stmt stmt, int align_bytes, bool verbose,
   std::sort(scopes.begin(), scopes.end());
   for (const std::string &scope : scopes) {
     const AllocationMap &allocations = collector.ascend_scope_allocs.at(scope);
-    if (allocations.size() <= 1)
+    if (allocations.size() <= 1) {
+      // A lone L0/L1 allocation builds no arena either: check it directly.
+      if (allocations.size() == 1)
+        CheckOnChipCapacity(scope, SingleAllocationFootprintBytes(allocations),
+                            allocations, limits.ForScope(scope));
       continue;
+    }
     auto order = collector.ascend_scope_order.find(scope);
     const AllocationOrder empty_order;
     const AllocationOrder &allocation_order =
@@ -447,7 +610,7 @@ tirx::Stmt MergeAllocations(tirx::Stmt stmt, int align_bytes, bool verbose,
     std::string suffix = scope.substr(7);
     SharedMemoryRewriter rewriter(allocations, verbose, align_bytes,
                                   "buf_dyn_" + suffix, scope + ".dyn", scope);
-    run(rewriter, allocations, allocation_order, scope);
+    run(rewriter, allocations, allocation_order, scope, scope);
   }
   return stmt;
 }
