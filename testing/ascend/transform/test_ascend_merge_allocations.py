@@ -59,3 +59,29 @@ def test_subcore_ub_allocations_have_independent_address_spaces(disable_reuse):
         if index:
             assert offsets[0] + 32 <= offsets[index] or offsets[index] + size <= offsets[0]
     assert offsets[1] < offsets[2] + 64 and offsets[2] < offsets[1] + 128
+def test_first_fit_packs_conflicting_buffers_into_compatible_footprints():
+    # Clique stacking pins every compatible buffer to one slot offset: the
+    # {a, b} + {c} partition costs max(256, 128) + 128 = 384 bytes and pins c
+    # at element 64 (the 256-byte slot boundary). First-fit packing instead
+    # places b and c side by side inside a's footprint, for 256 bytes total.
+    a, b, c = [tirx.decl_buffer((size,), "int32", name=name, scope="shared.dyn") for name, size in [("a", 64), ("b", 32), ("c", 32)]]
+    contract = {a.data: [b.data, c.data], b.data: [a.data], c.data: [a.data]}
+    body = tirx.SeqStmt(
+        [
+            *[tirx.AllocBuffer(buffer) for buffer in (a, b, c)],
+            *[tirx.BufferStore(buffer, index, [0]) for index, buffer in enumerate((a, b, c))],
+        ]
+    )
+    before = tvm.IRModule({"main": tirx.PrimFunc([], tirx.AttrStmt(contract, "tl.buffer_alias_map", 1, body))})
+    after = transform.MergeUBAllocations()(before)
+    assert not [node for node in nodes(after, tirx.AttrStmt) if node.attr_key == "tl.buffer_alias_map"]
+    offsets = {int(store.value): int(tvm.arith.Analyzer().simplify(store.indices[0])) for store in nodes(after, tirx.BufferStore)}
+    # b aliases a from the base, as the contract authorizes.
+    assert offsets[0] == 0
+    assert offsets[1] == 0
+    # c lands inside a's footprint right after b: element 32 (byte 128) is
+    # only reachable by first-fit packing; clique stacking would pin c at
+    # the next slot boundary, element 64 (byte 256).
+    assert offsets[2] == 32
+    # b and c remain disjoint.
+    assert offsets[1] + 32 <= offsets[2]

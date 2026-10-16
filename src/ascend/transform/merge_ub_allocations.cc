@@ -242,10 +242,11 @@ private:
   int final_alignment_;
 };
 
-CliquePartition BuildAliasCliquePartition(std::vector<CliqueVertex> vertices,
-                                          int final_alignment,
-                                          const BufferAliasMap &aliases) {
-  ValidateBufferAliasMap(aliases);
+// Pairwise conflicts derived from the alias contract: two storages conflict
+// unless the contract explicitly authorizes them to alias. Also fills each
+// vertex's conflict degree for the DSATUR selection heuristic.
+std::vector<std::vector<uint8_t>> BuildConflictMatrix(
+    std::vector<CliqueVertex> &vertices, const BufferAliasMap &aliases) {
   std::vector<std::vector<uint8_t>> conflicts(
       vertices.size(), std::vector<uint8_t>(vertices.size(), 0));
   for (CliqueVertex &vertex : vertices)
@@ -259,9 +260,79 @@ CliquePartition BuildAliasCliquePartition(std::vector<CliqueVertex> vertices,
       vertices[rhs].conflict_degree += conflict;
     }
   }
-  return GreedyCliquePartitioner(std::move(vertices), std::move(conflicts),
-                                 final_alignment)
-      .Solve();
+  return conflicts;
+}
+
+CliquePartition BuildAliasCliquePartition(
+    const std::vector<CliqueVertex> &vertices, int final_alignment,
+    const std::vector<std::vector<uint8_t>> &conflicts) {
+  return GreedyCliquePartitioner(vertices, conflicts, final_alignment).Solve();
+}
+
+struct FirstFitLayout {
+  std::vector<size_t> byte_offsets;
+  size_t total_size{0};
+};
+
+// Greedy per-buffer interval packing: visit buffers in order of decreasing
+// alignment, then decreasing size, and place each one at the lowest byte
+// offset that neither overlaps an already-placed conflicting buffer nor
+// violates its own alignment. Unlike clique stacking, which pins every
+// compatible buffer to the same slot offset and seals off the tail of the
+// largest member as dead space, this packs conflicting buffers side by side
+// into the footprints of compatible ones.
+FirstFitLayout
+BuildFirstFitLayout(const std::vector<CliqueVertex> &vertices,
+                    const std::vector<std::vector<uint8_t>> &conflicts,
+                    int final_alignment) {
+  std::vector<size_t> order(vertices.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+    const CliqueVertex &a = vertices[lhs];
+    const CliqueVertex &b = vertices[rhs];
+    if (a.alignment != b.alignment)
+      return a.alignment > b.alignment;
+    if (a.size != b.size)
+      return a.size > b.size;
+    return a.stable_index < b.stable_index;
+  });
+
+  struct Placed {
+    size_t vertex;
+    size_t begin;
+    size_t end;
+  };
+  std::vector<Placed> placed;
+  placed.reserve(vertices.size());
+
+  FirstFitLayout result;
+  result.byte_offsets.assign(vertices.size(), 0);
+  size_t top = 0;
+  for (size_t vertex : order) {
+    const CliqueVertex &item = vertices[vertex];
+    size_t offset = 0;
+    while (true) {
+      offset = AlignUp(offset, item.alignment);
+      bool clash = false;
+      size_t clash_top = offset;
+      for (const Placed &other : placed) {
+        if (!conflicts[vertex][other.vertex])
+          continue;
+        if (offset < other.end && other.begin < offset + item.size) {
+          clash = true;
+          clash_top = std::max(clash_top, other.end);
+        }
+      }
+      if (!clash)
+        break;
+      offset = clash_top;
+    }
+    result.byte_offsets[vertex] = offset;
+    placed.push_back({vertex, offset, offset + item.size});
+    top = std::max(top, offset + item.size);
+  }
+  result.total_size = AlignUp(top, final_alignment);
+  return result;
 }
 
 MemoryPlan BuildAliasMemoryPlan(const AllocationMap &allocations,
@@ -313,8 +384,12 @@ MemoryPlan BuildAliasMemoryPlan(const AllocationMap &allocations,
   MemoryPlan plan;
   size_t arena_top = 0;
   CliquePartition partition;
+  std::vector<size_t> offsets;
+  bool use_first_fit = false;
   if (!constant.empty()) {
-    partition = BuildAliasCliquePartition(constant, align_bytes, aliases);
+    std::vector<std::vector<uint8_t>> conflicts =
+        BuildConflictMatrix(constant, aliases);
+    partition = BuildAliasCliquePartition(constant, align_bytes, conflicts);
     ICHECK_EQ(partition.assignment.size(), constant.size());
     for (size_t clique_index = 0; clique_index < partition.cliques.size();
          ++clique_index) {
@@ -329,16 +404,45 @@ MemoryPlan BuildAliasMemoryPlan(const AllocationMap &allocations,
         }
       }
     }
-    for (size_t vertex = 0; vertex < constant.size(); ++vertex) {
-      int clique = partition.assignment[vertex];
-      ICHECK_GE(clique, 0);
-      ICHECK_LT(static_cast<size_t>(clique),
-                partition.layout.byte_offsets.size());
-      size_t offset = partition.layout.byte_offsets[clique];
-      plan.byte_offsets[constant[vertex].storage.get()] =
-          make_const(DataType::Int(32), static_cast<int64_t>(offset));
+    // Two legal layouts exist for the same contract: DSATUR clique stacking
+    // (every clique shares one slot) and per-buffer first-fit packing
+    // (conflicting buffers in disjoint ranges, compatible ones possibly
+    // partially overlapping). Always emit the denser of the two.
+    FirstFitLayout first_fit =
+        BuildFirstFitLayout(constant, conflicts, align_bytes);
+    use_first_fit = first_fit.total_size <= partition.layout.total_size;
+    if (use_first_fit) {
+      offsets = first_fit.byte_offsets;
+      arena_top = first_fit.total_size;
+    } else {
+      offsets.assign(constant.size(), 0);
+      for (size_t vertex = 0; vertex < constant.size(); ++vertex) {
+        int clique = partition.assignment[vertex];
+        ICHECK_GE(clique, 0);
+        ICHECK_LT(static_cast<size_t>(clique),
+                  partition.layout.byte_offsets.size());
+        offsets[vertex] = partition.layout.byte_offsets[clique];
+      }
+      arena_top = partition.layout.total_size;
     }
-    arena_top = partition.layout.total_size;
+    // Load-bearing invariant: storages the contract does not authorize to
+    // alias must occupy disjoint byte ranges in the chosen layout.
+    for (size_t lhs = 0; lhs < constant.size(); ++lhs) {
+      for (size_t rhs = lhs + 1; rhs < constant.size(); ++rhs) {
+        if (!conflicts[lhs][rhs])
+          continue;
+        size_t lhs_end = offsets[lhs] + constant[lhs].size;
+        size_t rhs_end = offsets[rhs] + constant[rhs].size;
+        ICHECK(lhs_end <= offsets[rhs] || rhs_end <= offsets[lhs])
+            << "Merged layout overlaps conflicting storages "
+            << constant[lhs].storage->name_hint << " and "
+            << constant[rhs].storage->name_hint;
+      }
+    }
+    for (size_t vertex = 0; vertex < constant.size(); ++vertex) {
+      plan.byte_offsets[constant[vertex].storage.get()] =
+          make_const(DataType::Int(32), static_cast<int64_t>(offsets[vertex]));
+    }
   }
 
   DataType offset_dtype = DataType::Int(64);
@@ -355,16 +459,16 @@ MemoryPlan BuildAliasMemoryPlan(const AllocationMap &allocations,
   if (verbose) {
     LOG(DEBUG) << "Buffer-alias-contract allocation plan:";
     LOG(DEBUG) << "  Total merged size: " << plan.total_size << " bytes";
-    LOG(DEBUG) << "  Constant clique partition: " << partition.cliques.size()
-               << " slot(s), deterministic DSATUR greedy";
-    for (size_t index = 0; index < partition.cliques.size(); ++index) {
-      const AliasClique &clique = partition.cliques[index];
-      LOG(DEBUG) << "    slot " << index
-                 << " offset=" << partition.layout.byte_offsets[index]
-                 << " size=" << clique.size
-                 << " alignment=" << clique.alignment;
-      for (size_t member : clique.members)
-        LOG(DEBUG) << "      " << constant[member].storage->name_hint;
+    if (!constant.empty()) {
+      LOG(DEBUG) << "  Constant layout mode: "
+                << (use_first_fit ? "per-buffer first-fit packing"
+                                  : "DSATUR clique stacking");
+      for (size_t vertex = 0; vertex < constant.size(); ++vertex) {
+        LOG(DEBUG) << "    " << constant[vertex].storage->name_hint
+                   << " offset=" << offsets[vertex]
+                   << " size=" << constant[vertex].size
+                   << " alignment=" << constant[vertex].alignment;
+      }
     }
     for (const auto &[var, offset] : plan.byte_offsets)
       LOG(DEBUG) << "    " << var->name_hint << " offset=" << offset;
