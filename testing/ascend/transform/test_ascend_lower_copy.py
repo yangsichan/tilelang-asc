@@ -71,10 +71,10 @@ def test_whole_buffer_transpose_preserves_ascend_copy_geometry(scope):
     assert int(load.args[8]) == 1
 
 
-def test_fp4_gm_to_l1_element_transpose_is_rejected():
+def test_unrewritten_fp4_gm_to_l1_element_transpose_is_rejected():
     src = tirx.decl_buffer((128, 64), "float4_e2m1fn", name="src")
     dst = tirx.decl_buffer((64, 128), "float4_e2m1fn", name="dst", scope="shared.l1")
-    with pytest.raises(ValueError, match="FP4 GM->L1 element transpose is unsupported"):
+    with pytest.raises(ValueError, match="FP4 GM->L1 element transpose must be rewritten"):
         _lower(src, dst, layouts={dst: make_ascend_nz_layout(dst)}, transpose=True)
 
 

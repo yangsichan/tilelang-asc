@@ -277,9 +277,14 @@ def copy(  # noqa: A001
             memory access. Defaults to None.
         transpose (bool, keyword-only): Ascend GM→L1 only. Emit dn2nz (which
             transposes the N/D mapping) instead of nd2nz. Defaults to False.
-            FP4 GM→L1 element transpose is unsupported. For GEMM, keep the
-            input orientation in L1 and use L1→L0 transpose loading selected
-            by the operand layout and GEMM transpose flags instead.
+            FP4 E2M1 uses a bit-preserving SIMT reorder through UB followed by
+            an NZ transfer to L1. It requires full compact zero-offset static
+            2D buffers, an NZ destination with rows divisible by 16 and columns
+            divisible by 64, and automatic scheduling with T.Kernel. Explicit
+            core/VF, MixedKernel, Task/PerCoreTask scopes, PTO and l2_cache_ctrl
+            are unsupported. If only GEMM needs a mathematical transpose,
+            prefer keeping the input orientation in L1 and using L1→L0
+            transpose loading selected by the operand layout and GEMM flags.
         l0_pitch (int | PrimExpr | None, keyword-only): L0 matrix pitch in
             16-element M/N fractal blocks, not bytes or an inter-block gap.
             For L1→L0A/L0B, overrides the destination pitch; for L0C→UB/GM,

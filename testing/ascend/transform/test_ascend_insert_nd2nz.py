@@ -1,11 +1,15 @@
 """InsertNd2Nz recognizes physical layouts before scheduling."""
 
+import operator
+
+import numpy as np
 import pytest
+import tilelang
 from tilelang import tvm
 from tilelang.ascend import language as T, transform
-from tilelang.layout import make_ascend_compact_nz_layout
+from tilelang.layout import make_ascend_compact_nz_layout, make_ascend_nz_layout
 from tvm import tirx
-from testing.ascend._ir import calls
+from testing.ascend._ir import calls, nodes
 
 
 def _module(*, rows=16, cols=128, padding=1, strides=None, staged=False, reshape=False, vf=None):
@@ -269,3 +273,103 @@ def test_explicit_post_copy_checks_capacity_relative_to_view(elem_offset, index,
     else:
         with pytest.raises(ValueError, match="physical span exceeds"):
             transform.InsertNd2Nz()(before)
+
+
+def _fp4_transpose_module(rows=32, cols=128, partial=False, mode=None):
+    src = tirx.decl_buffer(
+        (cols, rows),
+        "float4_e2m1fn",
+        name="src",
+        strides=(rows * 2, 1) if mode == "strided" else None,
+        elem_offset=1 if mode == "odd-offset" else 2 if mode == "offset" else 0,
+    )
+    dst = tirx.decl_buffer((rows, cols), "float4_e2m1fn", name="dst", scope="shared.l1", elem_offset=2 if mode == "dst-offset" else 0)
+    source = tirx.BufferRegion(src, [tvm.ir.Range(0, cols // 2), tvm.ir.Range(0, rows)]) if partial else src
+    destination = tirx.BufferRegion(dst, [tvm.ir.Range(0, rows), tvm.ir.Range(0, cols // 2)]) if partial else dst
+    options = {"l2_cache_ctrl": "NOTALLOC_KEEP"} if mode == "cache" else {}
+    body = tirx.Evaluate(T.copy(source, destination, transpose=True, **options))
+    if mode in ("CUBE", "VECTOR", "SIMD_VF"):
+        body = tirx.SBlock([], [], [], mode, body)
+    if mode in ("task", "per_core_task"):
+        body = tirx.AttrStmt(tirx.IntImm("int32", 0), "tl.ascend_" + mode, 1, body)
+    if mode == "mixed":
+        axis = tirx.IterVar(tvm.ir.Range(0, 2), tirx.Var("sid", "int32"), tirx.IterVar.ThreadIndex, "cthread")
+        body = tirx.AttrStmt(axis, "thread_extent", 2, body)
+    root = tirx.SBlock([], [], [], "root", body, alloc_buffers=[dst], annotations={"layout_map": {dst: make_ascend_nz_layout(dst)}})
+    func = tirx.PrimFunc([src.data], tirx.SBlockRealize([], True, root), buffer_map={src.data: src})
+    if mode == "pto":
+        func = func.with_attr("target", tvm.target.Target({"kind": "ascend", "keys": ["pto", "ascend"]}))
+    return tvm.IRModule({"main": func})
+
+
+@pytest.mark.parametrize("rows,cols,partial", [(32, 128, False), (64, 256, False), (24, 128, False), (32, 96, False), (32, 128, True)])
+def test_fp4_gm_to_l1_element_transpose(rows, cols, partial):
+    before = _fp4_transpose_module(rows, cols, partial)
+    if partial or rows % 16 or cols % 64:
+        with pytest.raises(ValueError, match="FP4 GM->L1 element transpose requires"):
+            transform.InsertNd2Nz()(before)
+        return
+    after = transform.InsertNd2Nz()(before)
+    assert not calls(after, "tl.tileop.ascend_copy")
+    (transfer,) = calls(after, "tl.ascend_copy_ubuf_to_cbuf")
+    assert int(tvm.arith.Analyzer().simplify(transfer.args[4])) == rows * cols // 64
+    assert int(transfer.args[1].args[1]) == rows * cols // 2
+
+
+@pytest.mark.parametrize("mode", ["CUBE", "VECTOR", "SIMD_VF", "mixed", "manual", "cache", "task", "per_core_task", "pto"])
+def test_fp4_transpose_execution_requirements(mode):
+    before = _fp4_transpose_module(mode=mode)
+    config = {tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE.value: False} if mode == "manual" else {}
+    error = "PTO" if mode == "pto" else "l2_cache_ctrl" if mode == "cache" else "automatic core scheduling"
+    with (
+        tvm.transform.PassContext(config=config),
+        pytest.raises(ValueError, match=error),
+    ):
+        transform.InsertNd2Nz()(before)
+
+
+@pytest.mark.parametrize("mode", ["strided", "odd-offset", "offset", "dst-offset"])
+def test_fp4_transpose_rejects_unsupported_source_storage(mode):
+    with pytest.raises(ValueError, match="FP4 GM->L1 element transpose requires"):
+        transform.InsertNd2Nz()(_fp4_transpose_module(mode=mode))
+
+
+def test_fp4_transpose_rejects_dynamic_shapes():
+    with pytest.raises(ValueError, match="FP4 transpose rows must be static"):
+        transform.InsertNd2Nz()(_fp4_transpose_module(rows=tirx.Var("rows", "int32")))
+
+
+@pytest.mark.parametrize("rows,cols", [(16, 64), (32, 128), (64, 256)])
+def test_fp4_transpose_preserves_packed_codes(rows, cols):
+    after = transform.InsertNd2Nz()(_fp4_transpose_module(rows, cols))
+    (store,) = nodes(after, tirx.BufferStore)
+    (loop,) = nodes(after, tirx.For)
+    thread = next(
+        node.node.var
+        for node in nodes(after, tirx.AttrStmt)
+        if isinstance(node.node, tirx.IterVar) and node.node.thread_tag == "threadIdx.x"
+    )
+    codes = np.random.default_rng(0).integers(0, 16, size=(cols, rows), dtype=np.uint8)
+    packed = (codes[:, ::2] | (codes[:, 1::2] << 4)).reshape(-1)
+    transposed = codes.T
+    expected = (transposed[:, ::2] | (transposed[:, 1::2] << 4)).reshape(rows, cols // 64, 32).transpose(1, 0, 2).reshape(-1)
+    analyzer = tvm.arith.Analyzer()
+    operations = {
+        "tirx.shift_right": operator.rshift,
+        "tirx.shift_left": operator.lshift,
+        "tirx.bitwise_and": operator.and_,
+        "tirx.bitwise_or": operator.or_,
+    }
+    for index, expected_byte in enumerate(expected):
+        value = tirx.stmt_functor.substitute(store.value, {loop.loop_var: index // 128, thread: index % 128})
+
+        def load_byte(node):
+            if isinstance(node, tirx.BufferLoad):
+                address = int(analyzer.simplify(node.indices[0]))
+                return tirx.const(int(packed[address]), "uint8")
+            if isinstance(node, tirx.Call) and node.op.name in operations:
+                arguments = [int(analyzer.simplify(argument)) for argument in node.args]
+                return tirx.const(operations[node.op.name](*arguments), node.dtype)
+
+        evaluated = tirx.stmt_functor.ir_transform(tirx.Evaluate(value), None, load_byte)
+        assert int(analyzer.simplify(evaluated.value)) == int(expected_byte)

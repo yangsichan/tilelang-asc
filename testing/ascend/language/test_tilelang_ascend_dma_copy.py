@@ -55,7 +55,8 @@ def _fp4_matrix_copy_kernel(route, m=32, k=128):
 @pytest.mark.parametrize(
     "route,rows,cols",
     [("normal", 16, 64), ("normal", 32, 128), ("normal", 64, 256)]
-    + [(route, 64, cols) for route in ("l0-transpose-a", "l0-transpose-b") for cols in (64, 128, 256)],
+    + [(route, 64, cols) for route in ("l0-transpose-a", "l0-transpose-b") for cols in (64, 128, 256)]
+    + [(route, rows, cols) for route in ("gm-transpose-a", "gm-transpose-b") for rows, cols in ((16, 64), (32, 128), (64, 64), (64, 256))],
 )
 def test_fp4_matrix_copy_with_mx_scales(route, rows, cols):
     kernel = tilelang.compile(_fp4_matrix_copy_kernel(route, rows, cols), target="ascend", out_idx=-1)
@@ -69,7 +70,7 @@ def test_fp4_matrix_copy_with_mx_scales(route, rows, cols):
         b_codes = torch.randint(0, 16, (rows, cols), dtype=torch.uint8, generator=generator)
         identity_probe = rows == cols == 64 and seed == 0
         if identity_probe:
-            if route == "l0-transpose-a":
+            if route in ("gm-transpose-a", "l0-transpose-a"):
                 b_codes = torch.eye(rows, dtype=torch.uint8) * 2
             else:
                 a_codes = torch.eye(rows, dtype=torch.uint8) * 2
@@ -80,8 +81,8 @@ def test_fp4_matrix_copy_with_mx_scales(route, rows, cols):
         if identity_probe:
             sa.fill_(127)
             sb.fill_(127)
-        a_input = a_codes.T.contiguous() if route == "l0-transpose-a" else a_codes
-        b_input = b_codes.T.contiguous() if route == "l0-transpose-b" else b_codes
+        a_input = a_codes.T.contiguous() if route in ("gm-transpose-a", "l0-transpose-a") else a_codes
+        b_input = b_codes.T.contiguous() if route in ("gm-transpose-b", "l0-transpose-b") else b_codes
         a_packed = (a_input[:, 0::2] | (a_input[:, 1::2] << 4)).view(torch.float4_e2m1fn_x2)
         b_packed = (b_input[:, 0::2] | (b_input[:, 1::2] << 4)).view(torch.float4_e2m1fn_x2)
         actual = kernel(
@@ -92,7 +93,99 @@ def test_fp4_matrix_copy_with_mx_scales(route, rows, cols):
         b_scaled = b * torch.pow(2.0, sb.float() - 127).repeat_interleave(32, dim=1)
         torch.testing.assert_close(actual.cpu(), a_scaled @ b_scaled.T, rtol=1e-5, atol=1e-5)
         if identity_probe:
-            torch.testing.assert_close(actual.cpu(), a if route == "l0-transpose-a" else b.T, rtol=0, atol=0)
+            torch.testing.assert_close(actual.cpu(), a if route in ("gm-transpose-a", "l0-transpose-a") else b.T, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.skipif(not hasattr(torch, "float4_e2m1fn_x2"), reason="PyTorch float4_e2m1fn_x2 dtype is unavailable")
+@pytest.mark.parametrize("rows,cols,pipelined", [(16, 64, False), (32, 128, False), (64, 256, False), (64, 256, True)])
+def test_fp4_gm_transpose_l1_packed_bytes(rows, cols, pipelined):
+    byte_count = rows * cols // 2
+    packed_cols = cols // 2
+
+    # Distinct sources expose stale L1 contents between independent copies.
+    # The same-source pipeline separately covers loop scheduling and scratch
+    # reuse, but cannot detect stale contents equal to the current iteration.
+    # num_stages is a version-count bound, not a guarantee of two physical slots.
+    @T.prim_func
+    def main(
+        src_a: T.Tensor((cols, rows), "float4_e2m1fn"),
+        src_b: T.Tensor((cols, rows), "float4_e2m1fn"),
+        src_c: T.Tensor((cols, rows), "float4_e2m1fn"),
+        identity: T.Tensor((packed_cols, packed_cols), "int8"),
+        out: T.Tensor((3, rows, packed_cols), "int32"),
+    ):
+        with T.Kernel(1):
+            T.import_source(
+                "__aicore__ inline void load_fp4_bytes(__ca__ int8_t* dst, __cbuf__ void* src) {"
+                "asc_sync(); asc_copy_l12l0a(dst, (__cbuf__ int8_t*)src, "
+                f"0, 0, {rows // 16}, {cols // 64}, {rows // 16}, {rows // 16}); asc_sync();"
+                "}\n"
+            )
+            l1 = T.alloc_l1((rows, cols), "float4_e2m1fn")
+            a0 = T.alloc_l0a((rows, packed_cols), "int8")
+            b1 = T.alloc_l1((packed_cols, packed_cols), "int8")
+            b0 = T.alloc_l0b((packed_cols, packed_cols), "int8")
+            acc = T.alloc_l0c((rows, packed_cols), "int32")
+            T.copy(identity, b1)
+            T.copy(b1, b0)
+
+            if pipelined:
+                for iteration in T.Pipelined(3, num_stages=2):
+                    with T.Stage(0):
+                        T.copy(src_a, l1, transpose=True)
+                    T.call_extern(
+                        "handle",
+                        "load_fp4_bytes",
+                        T.access_ptr(a0[0, 0], "w", extent=byte_count),
+                        T.access_ptr(l1[0, 0], "r", extent=rows * cols),
+                    )
+                    T.gemm(a0, b0, acc, transpose_B=True, clear_accum=True)
+                    T.copy(acc, out[iteration, :, :])
+            else:
+                T.copy(src_a, l1, transpose=True)
+                T.call_extern(
+                    "handle",
+                    "load_fp4_bytes",
+                    T.access_ptr(a0[0, 0], "w", extent=byte_count),
+                    T.access_ptr(l1[0, 0], "r", extent=rows * cols),
+                )
+                T.gemm(a0, b0, acc, transpose_B=True, clear_accum=True)
+                T.copy(acc, out[0, :, :])
+
+                T.copy(src_b, l1, transpose=True)
+                T.call_extern(
+                    "handle",
+                    "load_fp4_bytes",
+                    T.access_ptr(a0[0, 0], "w", extent=byte_count),
+                    T.access_ptr(l1[0, 0], "r", extent=rows * cols),
+                )
+                T.gemm(a0, b0, acc, transpose_B=True, clear_accum=True)
+                T.copy(acc, out[1, :, :])
+
+                T.copy(src_c, l1, transpose=True)
+                T.call_extern(
+                    "handle",
+                    "load_fp4_bytes",
+                    T.access_ptr(a0[0, 0], "w", extent=byte_count),
+                    T.access_ptr(l1[0, 0], "r", extent=rows * cols),
+                )
+                T.gemm(a0, b0, acc, transpose_B=True, clear_accum=True)
+                T.copy(acc, out[2, :, :])
+
+    kernel = tilelang.compile(main, target="ascend", out_idx=-1)
+    for seed in (0, 1):
+        generator = torch.Generator().manual_seed(seed)
+        sources, expected = [], []
+        for stage in range(3):
+            packed = torch.randint(0, 256, (cols, rows // 2), dtype=torch.uint8, generator=generator)
+            packed.reshape(-1)[:256] = torch.arange(256, dtype=torch.uint8) ^ (stage * 0x55)
+            codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(cols, rows).T.contiguous()
+            expected.append(codes[:, ::2] | (codes[:, 1::2] << 4))
+            sources.append(packed.view(torch.float4_e2m1fn_x2).npu())
+        actual = kernel(*sources, torch.eye(packed_cols, dtype=torch.int8).npu()).cpu()
+        reference = torch.stack([expected[0]] * 3 if pipelined else expected).view(torch.int8).int()
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("src_width,ub_width,cols", [(4, 64, 4), (8, 16, 4), (64, 1, 1)])
