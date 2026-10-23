@@ -24,8 +24,11 @@
 
 #include "buffer_alias.h"
 #include "merge_ub_common.h"
+#include "onchip_memory_limits.h"
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/attrs.h>
+#include <tvm/target/target.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -414,12 +417,36 @@ private:
   bool found_contract_{false};
 };
 
+/*!
+ * \brief Capacity check for a body that carries no buffer-alias contract.
+ */
+void CheckScopesWithoutContract(const Stmt &stmt, int align_bytes,
+                                const ascend::OnChipLimits &limits) {
+  merge_ub::AllocateCollector collector;
+  collector(stmt);
+  auto check = [&](const std::string &scope_key,
+                   const merge_ub::AllocationMap &allocations) {
+    if (allocations.empty())
+      return;
+    merge_ub::MemoryPlan plan =
+        merge_ub::BuildSequentialPlan(allocations, align_bytes);
+    merge_ub::CheckOnChipCapacity(scope_key, plan.total_size, allocations,
+                                  limits.GetScopeLimit(scope_key));
+  };
+  check("shared.dyn", collector.dyn_shmem_allocs);
+  for (const auto &[scope, allocations] : collector.ascend_scope_allocs)
+    check(scope, allocations);
+}
+
 Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
-                        bool disable_reuse) {
+                        bool disable_reuse,
+                        const ascend::OnChipLimits &limits) {
   BufferAliasContractExtractor extractor;
   stmt = extractor.Extract(stmt);
-  if (!extractor.FoundContract())
+  if (!extractor.FoundContract()) {
+    CheckScopesWithoutContract(stmt, align_bytes, limits);
     return stmt;
+  }
   BufferAliasMap aliases = extractor.Aliases();
   ValidateBufferAliasMap(aliases);
 
@@ -463,7 +490,7 @@ Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
     return result;
   };
   return merge_ub::MergeAllocations(std::move(stmt), align_bytes, verbose,
-                                    false, planner);
+                                    false, planner, limits);
 }
 
 } // namespace
@@ -479,9 +506,17 @@ Pass MergeUBAllocations(int align_bytes = 16, bool disable_reuse = false) {
         context
             ->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
+    // Physical capacities of the targeted device. All-zero (no target
+    // attribute, or a non-Ascend target) disables the capacity check. Read the
+    // body before it is moved: the UB capacity depends on a SIMT_VF scan of it.
+    auto target_attr = func->GetAttr<Target>(tvm::attr::kTarget);
+    ascend::OnChipLimits limits =
+        target_attr.defined()
+            ? ascend::GetOnChipLimits(target_attr.value(), func->body)
+            : ascend::OnChipLimits{};
     PrimFuncNode *writer = func.CopyOnWrite();
     writer->body = tl::MergeUBAllocations(std::move(writer->body), align_bytes,
-                                          verbose, disable_reuse);
+                                          verbose, disable_reuse, limits);
     return func;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeUBAllocations", {});

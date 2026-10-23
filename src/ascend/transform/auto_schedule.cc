@@ -64,6 +64,7 @@
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
 #include "ascend/transform/buffer_version.h"
+#include "ascend/transform/onchip_memory_limits.h"
 #include "backend/common/target_utils.h"
 #include "op/utils.h"
 #include "runtime/thread_storage_scope.h"
@@ -80,64 +81,8 @@ using namespace ascend;
 
 namespace {
 
-// AutoSchedule target resource limits.
-
-// Check whether a kernel body contains any SIMT_VF blocks. SIMT_VF
-// (asc_vf_call) reserves 32 KB of the physical 248 KB Unified Buffer for
-// thread context, so the usable shared memory depends on its presence.
-class SimtVFDetector : public tirx::StmtVisitor {
-public:
-  bool found = false;
-
-  void VisitStmt_(const tirx::SBlockNode *op) override {
-    if (op->name_hint == "SIMT_VF") {
-      found = true;
-    }
-    tirx::StmtVisitor::VisitStmt_(op);
-  }
-};
-
-inline bool HasSimtVF(const tirx::Stmt &stmt) {
-  SimtVFDetector detector;
-  detector(stmt);
-  return detector.found;
-}
-
-inline int64_t GetSharedMemoryLimit(const tirx::Stmt &kernel_body) {
-  constexpr int64_t kPhysicalUnifiedBufferSize = 248 * 1024;
-  constexpr int64_t kSimtVFThreadContextSize = 32 * 1024;
-  return HasSimtVF(kernel_body)
-             ? kPhysicalUnifiedBufferSize - kSimtVFThreadContextSize
-             : kPhysicalUnifiedBufferSize;
-}
-
-inline int64_t GetL1MemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 512 * 1024; // 512 KB L1 cache on Ascend
-  }
-  return 0;
-}
-
-inline int64_t GetL0CMemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 256 * 1024; // 256 KB L0C buffer on Ascend
-  }
-  return 0;
-}
-
-inline int64_t GetL0AMemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 64 * 1024; // 64 KB L0A buffer on Ascend
-  }
-  return 0;
-}
-
-inline int64_t GetL0BMemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 64 * 1024; // 64 KB L0B buffer on Ascend
-  }
-  return 0;
-}
+// AutoSchedule target resource limits live in onchip_memory_limits.h, shared
+// with the MergeUBAllocations overflow check.
 
 // Scheduler.
 
