@@ -7,6 +7,94 @@ import tilelang.testing
 from tilelang.ascend import language as T
 
 
+def _fp4_matrix_copy_kernel(route, m=32, k=128):
+    dtype = "float4_e2m1fn"
+    n = m
+    scale_pairs = k // 64
+    gm_trans_a, gm_trans_b = route == "gm-transpose-a", route == "gm-transpose-b"
+    l0_trans_a, l0_trans_b = route == "l0-transpose-a", route == "l0-transpose-b"
+    a_shape = (k, m) if gm_trans_a or l0_trans_a else (m, k)
+    b_shape = (k, n) if gm_trans_b or l0_trans_b else (n, k)
+    a_tile = (k, m) if l0_trans_a else (m, k)
+    b_tile = (k, n) if l0_trans_b else (n, k)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor(a_shape, dtype),
+        B: T.Tensor(b_shape, dtype),
+        SA: T.Tensor((scale_pairs, m), "uint16"),
+        SB: T.Tensor((scale_pairs, n), "uint16"),
+        O: T.Tensor((m, n), "float32"),
+    ):
+        with T.Kernel(1):
+            a1 = T.alloc_l1(a_tile, dtype)
+            b1 = T.alloc_l1(b_tile, dtype)
+            a0 = T.alloc_l0a(a_tile, dtype)
+            b0 = T.alloc_l0b(b_tile, dtype)
+            sa1 = T.alloc_l1((m, scale_pairs), "uint16")
+            sb1 = T.alloc_l1((n, scale_pairs), "uint16")
+            sa0 = T.alloc_l0a_sf(a0, sf_shape=(m, scale_pairs))
+            sb0 = T.alloc_l0b_sf(b0, sf_shape=(n, scale_pairs))
+            acc = T.alloc_l0c((m, n), "float32")
+            T.copy(A, a1, transpose=gm_trans_a)
+            T.copy(B, b1, transpose=gm_trans_b)
+            T.copy(SA, sa1, transpose=True)
+            T.copy(SB, sb1, transpose=True)
+            T.copy(a1, a0)
+            T.copy(b1, b0)
+            T.copy(sa1, sa0)
+            T.copy(sb1, sb0)
+            T.gemm_blockscaled(a0, b0, acc, sa0, sb0, transpose_A=l0_trans_a, transpose_B=not l0_trans_b, clear_accum=True)
+            T.copy(acc, O)
+
+    return main
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.skipif(not hasattr(torch, "float4_e2m1fn_x2"), reason="PyTorch float4_e2m1fn_x2 dtype is unavailable")
+@pytest.mark.parametrize(
+    "route,rows,cols",
+    [("normal", 16, 64), ("normal", 32, 128), ("normal", 64, 256)]
+    + [(route, 64, cols) for route in ("l0-transpose-a", "l0-transpose-b") for cols in (64, 128, 256)],
+)
+def test_fp4_matrix_copy_with_mx_scales(route, rows, cols):
+    kernel = tilelang.compile(_fp4_matrix_copy_kernel(route, rows, cols), target="ascend", out_idx=-1)
+    if route.startswith("l0-transpose-"):
+        operand = "a" if route.endswith("a") else "b"
+        assert f"asc_copy_l12l0{operand}_transpose" in kernel.get_kernel_source()
+    magnitudes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    for seed in (0, 1):
+        generator = torch.Generator().manual_seed(seed)
+        a_codes = torch.randint(0, 16, (rows, cols), dtype=torch.uint8, generator=generator)
+        b_codes = torch.randint(0, 16, (rows, cols), dtype=torch.uint8, generator=generator)
+        identity_probe = rows == cols == 64 and seed == 0
+        if identity_probe:
+            if route == "l0-transpose-a":
+                b_codes = torch.eye(rows, dtype=torch.uint8) * 2
+            else:
+                a_codes = torch.eye(rows, dtype=torch.uint8) * 2
+        a = magnitudes[(a_codes & 7).long()] * torch.where(a_codes < 8, 1.0, -1.0)
+        b = magnitudes[(b_codes & 7).long()] * torch.where(b_codes < 8, 1.0, -1.0)
+        sa = torch.randint(125, 130, (rows, cols // 32), dtype=torch.uint8, generator=generator)
+        sb = torch.randint(125, 130, (rows, cols // 32), dtype=torch.uint8, generator=generator)
+        if identity_probe:
+            sa.fill_(127)
+            sb.fill_(127)
+        a_input = a_codes.T.contiguous() if route == "l0-transpose-a" else a_codes
+        b_input = b_codes.T.contiguous() if route == "l0-transpose-b" else b_codes
+        a_packed = (a_input[:, 0::2] | (a_input[:, 1::2] << 4)).view(torch.float4_e2m1fn_x2)
+        b_packed = (b_input[:, 0::2] | (b_input[:, 1::2] << 4)).view(torch.float4_e2m1fn_x2)
+        actual = kernel(
+            a_packed.npu(), b_packed.npu(), sa.view(torch.uint16).T.contiguous().npu(), sb.view(torch.uint16).T.contiguous().npu()
+        )
+        torch.npu.synchronize()
+        a_scaled = a * torch.pow(2.0, sa.float() - 127).repeat_interleave(32, dim=1)
+        b_scaled = b * torch.pow(2.0, sb.float() - 127).repeat_interleave(32, dim=1)
+        torch.testing.assert_close(actual.cpu(), a_scaled @ b_scaled.T, rtol=1e-5, atol=1e-5)
+        if identity_probe:
+            torch.testing.assert_close(actual.cpu(), a if route == "l0-transpose-a" else b.T, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("src_width,ub_width,cols", [(4, 64, 4), (8, 16, 4), (64, 1, 1)])
 def test_strided_dma_roundtrip(src_width, ub_width, cols):
     @T.prim_func

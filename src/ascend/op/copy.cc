@@ -603,6 +603,10 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     PrimExpr physical_inner_elems = valid_inner_elems;
     std::string physical_dtype;
     if (op.src->dtype.is_float4_e2m1fn() && op.dst->dtype.is_float4_e2m1fn()) {
+      TVM_FFI_CHECK(!needs_transpose, ValueError)
+          << "FP4 GM->L1 element transpose is unsupported: byte DN2NZ cannot "
+             "transpose individual FP4 elements. For GEMM, copy to L1 "
+             "without transpose and use L1->L0 transpose loading instead.";
       // dav-3510 exposes GM->L1 ND2NZ for 8/16/32-bit storage types.  FP4 is
       // physically packed as two values per byte, so issue the DMA as int8
       // and express the inner dimension in packed-byte units.
