@@ -600,28 +600,33 @@ private:
     Var thread("fp4_transpose_thread", DataType::Int(32));
     Var chunk("fp4_transpose_chunk", DataType::Int(32));
     PrimExpr index = chunk * kSimtVFLanes + thread;
-    PrimExpr row = FloorMod(FloorDiv(index, 32), Integer(rows));
+    // One source byte supplies two destination rows. Reuse both nibbles while
+    // keeping each group of 32 lanes contiguous in the NZ scratch buffer.
+    PrimExpr pair_count = Integer(rows * cols / 4);
+    PrimExpr row = FloorMod(FloorDiv(index, 32), Integer(rows / 2));
     PrimExpr col =
-        FloorDiv(index, Integer(rows * 32)) * 64 + FloorMod(index, 32) * 2;
-    PrimExpr shift = FloorMod(row, 2) * 4;
-    PrimExpr low = bitwise_and(
-        right_shift(cast(DataType::UInt(32),
-                         BufferLoad(source, {col * Integer(rows / 2) +
-                                             FloorDiv(row, 2)})),
-                    shift),
-        make_const(DataType::UInt(32), 15));
-    PrimExpr high = bitwise_and(
-        right_shift(cast(DataType::UInt(32),
-                         BufferLoad(source, {(col + 1) * Integer(rows / 2) +
-                                             FloorDiv(row, 2)})),
-                    shift),
-        make_const(DataType::UInt(32), 15));
-    Stmt body = BufferStore(
-        scratch, cast(DataType::UInt(8), bitwise_or(low, left_shift(high, 4))),
-        {index});
-    body = IfThenElse(index < byte_count, body);
+        FloorDiv(index, Integer(rows * 16)) * 64 + FloorMod(index, 32) * 2;
+    PrimExpr dst_index = FloorDiv(index, 32) * 64 + FloorMod(index, 32);
+    Var first_byte("fp4_transpose_first_byte", DataType::UInt(32));
+    Var second_byte("fp4_transpose_second_byte", DataType::UInt(32));
+    PrimExpr mask = make_const(DataType::UInt(32), 15);
+    PrimExpr low = bitwise_or(bitwise_and(first_byte, mask),
+                              left_shift(bitwise_and(second_byte, mask), 4));
+    PrimExpr high = bitwise_or(right_shift(first_byte, 4),
+                               left_shift(right_shift(second_byte, 4), 4));
+    Stmt body = SeqStmt({
+        Bind(first_byte,
+             cast(DataType::UInt(32),
+                  BufferLoad(source, {col * Integer(rows / 2) + row}))),
+        Bind(second_byte,
+             cast(DataType::UInt(32),
+                  BufferLoad(source, {(col + 1) * Integer(rows / 2) + row}))),
+        BufferStore(scratch, cast(DataType::UInt(8), low), {dst_index}),
+        BufferStore(scratch, cast(DataType::UInt(8), high), {dst_index + 32}),
+    });
+    body = IfThenElse(index < pair_count, body);
     body = For(chunk, 0,
-               Integer((rows * cols / 2 + kSimtVFLanes - 1) / kSimtVFLanes),
+               Integer((rows * cols / 4 + kSimtVFLanes - 1) / kSimtVFLanes),
                ForKind::kSerial, body);
     body = AttrStmt(StringImm("simtvf"), "tl.simtvf_scope", Integer(1), body);
     for (const String &tag : {String("threadIdx.z"), String("threadIdx.y")}) {

@@ -339,18 +339,17 @@ def test_fp4_transpose_rejects_dynamic_shapes():
         transform.InsertNd2Nz()(_fp4_transpose_module(rows=tirx.Var("rows", "int32")))
 
 
-@pytest.mark.parametrize("rows,cols", [(16, 64), (32, 128), (64, 256)])
+@pytest.mark.parametrize("rows,cols", [(16, 64), (32, 128), (64, 256), (48, 192)])
 def test_fp4_transpose_preserves_packed_codes(rows, cols):
     after = transform.InsertNd2Nz()(_fp4_transpose_module(rows, cols))
-    (store,) = nodes(after, tirx.BufferStore)
     (loop,) = nodes(after, tirx.For)
-    thread = next(
-        node.node.var
-        for node in nodes(after, tirx.AttrStmt)
-        if isinstance(node.node, tirx.IterVar) and node.node.thread_tag == "threadIdx.x"
+    thread_axis = next(
+        node for node in nodes(after, tirx.AttrStmt) if isinstance(node.node, tirx.IterVar) and node.node.thread_tag == "threadIdx.x"
     )
-    codes = np.random.default_rng(0).integers(0, 16, size=(cols, rows), dtype=np.uint8)
-    packed = (codes[:, ::2] | (codes[:, 1::2] << 4)).reshape(-1)
+    thread = thread_axis.node.var
+    packed = np.random.default_rng(0).integers(0, 256, size=cols * rows // 2, dtype=np.uint8)
+    packed[:256] = np.arange(256, dtype=np.uint8)
+    codes = np.stack((packed & 15, packed >> 4), axis=-1).reshape(cols, rows)
     transposed = codes.T
     expected = (transposed[:, ::2] | (transposed[:, 1::2] << 4)).reshape(rows, cols // 64, 32).transpose(1, 0, 2).reshape(-1)
     analyzer = tvm.arith.Analyzer()
@@ -360,16 +359,46 @@ def test_fp4_transpose_preserves_packed_codes(rows, cols):
         "tirx.bitwise_and": operator.and_,
         "tirx.bitwise_or": operator.or_,
     }
-    for index, expected_byte in enumerate(expected):
-        value = tirx.stmt_functor.substitute(store.value, {loop.loop_var: index // 128, thread: index % 128})
+    actual = np.empty_like(expected)
+    written = np.zeros(len(expected), dtype=np.bool_)
+
+    def evaluate(expr, bindings):
+        value = tirx.stmt_functor.substitute(expr, bindings)
 
         def load_byte(node):
             if isinstance(node, tirx.BufferLoad):
                 address = int(analyzer.simplify(node.indices[0]))
+                assert 0 <= address < len(packed)
                 return tirx.const(int(packed[address]), "uint8")
             if isinstance(node, tirx.Call) and node.op.name in operations:
                 arguments = [int(analyzer.simplify(argument)) for argument in node.args]
                 return tirx.const(operations[node.op.name](*arguments), node.dtype)
 
         evaluated = tirx.stmt_functor.ir_transform(tirx.Evaluate(value), None, load_byte)
-        assert int(analyzer.simplify(evaluated.value)) == int(expected_byte)
+        return int(analyzer.simplify(evaluated.value))
+
+    def execute(stmt, bindings):
+        if isinstance(stmt, tirx.SeqStmt):
+            bindings = dict(bindings)
+            for child in stmt.seq:
+                execute(child, bindings)
+        elif isinstance(stmt, tirx.Bind):
+            bindings[stmt.var] = tirx.const(evaluate(stmt.value, bindings), stmt.var.dtype)
+        elif isinstance(stmt, tirx.IfThenElse):
+            if evaluate(stmt.condition, bindings):
+                execute(stmt.then_case, bindings)
+            elif stmt.else_case is not None:
+                execute(stmt.else_case, bindings)
+        else:
+            assert isinstance(stmt, tirx.BufferStore)
+            address = evaluate(stmt.indices[0], bindings)
+            assert 0 <= address < len(actual)
+            assert not written[address]
+            actual[address] = evaluate(stmt.value, bindings)
+            written[address] = True
+
+    for chunk in range(int(loop.extent)):
+        for lane in range(int(thread_axis.value)):
+            execute(loop.body, {loop.loop_var: tirx.const(chunk, "int32"), thread: tirx.const(lane, "int32")})
+    assert written.all()
+    np.testing.assert_array_equal(actual, expected)
