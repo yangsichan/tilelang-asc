@@ -4550,6 +4550,9 @@ void CodeGenTileLangPTO::EmitAscendCopyUbufToCbuf(const CallNode *op) {
 }
 
 void CodeGenTileLangPTO::EmitAscendNd2NzPostCopy(const CallNode *op) {
+  const std::string dtype = Downcast<StringImm>(op->args[6])->value;
+  ICHECK(dtype == "float" || dtype == "half" || dtype == "bfloat16_t")
+      << "PTO ND->NZ post-copy does not support " << dtype;
   auto geometry = tl::ParseNd2NzGeometry(op, false);
   if (geometry.Empty())
     return;
@@ -4573,6 +4576,10 @@ void CodeGenTileLangPTO::EmitAscendNd2NzScatter(const CallNode *op) {
   int64_t rows = geometry.rows, cols = geometry.cols;
   std::string src_dtype = Downcast<StringImm>(op->args[5])->value;
   std::string dst_dtype = Downcast<StringImm>(op->args[6])->value;
+
+  ICHECK(src_dtype == "float" || src_dtype == "half" ||
+         src_dtype == "bfloat16_t")
+      << "PTO ND->NZ scatter does not support " << src_dtype;
 
   ICHECK(rows % 16 == 0) << "PTO nd2nz_scatter requires ROWS % 16 == 0, got "
                          << rows;
