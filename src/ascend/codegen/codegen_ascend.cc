@@ -1612,6 +1612,11 @@ void CodeGenTileLangAscend::EmitMxSfLoad_(const CallNode *op, bool is_l0a) {
 void CodeGenTileLangAscend::EmitUbufToL1Copy_(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 7)
       << "tl.ascend_copy_ubuf_to_cbuf expects exactly 7 arguments";
+  bool single_aiv = op->annotations.Get("single_aiv").has_value();
+  if (single_aiv) {
+    PrintIndent();
+    stream << "if (asc_get_sub_block_id() == 0) {\n";
+  }
 
   // IR arg 2 is sub_blockid, which asc_copy_ub2l1 does not take.
   EmitCApiCall_("asc_copy_ub2l1", {{op->args[0], "(__cbuf__ void*)(", ")"},
@@ -1620,6 +1625,10 @@ void CodeGenTileLangAscend::EmitUbufToL1Copy_(const CallNode *op) {
                                    {op->args[4]},
                                    {op->args[5]},
                                    {op->args[6]}});
+  if (single_aiv) {
+    PrintIndent();
+    stream << "}\n";
+  }
 }
 
 void CodeGenTileLangAscend::EmitNd2NzScatter_(const CallNode *op) {
