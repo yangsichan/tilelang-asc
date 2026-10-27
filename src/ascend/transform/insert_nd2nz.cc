@@ -5,7 +5,6 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/target/target.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -21,7 +20,6 @@
 #include "ascend/op/nd2nz.h"
 #include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
-#include "ascend/transform/attr.h"
 #include "op/copy.h"
 #include "op/utils.h"
 #include "support/check.h"
@@ -110,10 +108,6 @@ public:
     arith::Analyzer analyzer;
     analyzer.z3_prover.SetRLimit(50000);
     Nd2NzInserter inserter(&analyzer);
-    if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
-      for (const String &key : target.value()->keys)
-        inserter.is_pto_ |= key == "pto";
-    }
     inserter.MarkBufferMapShapes(func);
     PrimFuncNode *write_ptr = func.CopyOnWrite();
     write_ptr->body = inserter(std::move(write_ptr->body));
@@ -532,124 +526,6 @@ private:
                                     Integer(geometry.dst_pitch));
   }
 
-  std::optional<Stmt> RewriteFP4Transpose(const AscendCopy &operation) {
-    const AscendCopyNode &copy = *operation.get();
-    if (!IsGlobalBuffer(copy.src) || !IsL1Buffer(copy.dst) ||
-        !copy.src->dtype.is_float4_e2m1fn() || !copy.transpose)
-      return std::nullopt;
-    bool auto_schedule = tvm::transform::PassContext::Current()
-                             ->GetConfig<Bool>(kEnableAutoSchedule, Bool(true))
-                             .value();
-    TVM_FFI_CHECK(!is_pto_, ValueError)
-        << "FP4 GM->L1 element transpose is not supported by PTO.";
-    TVM_FFI_CHECK(auto_schedule && !inside_unsupported_scope_, ValueError)
-        << "FP4 GM->L1 element transpose currently requires automatic core "
-           "scheduling with T.Kernel, outside explicit Cube/Vector, "
-           "MixedKernel, SIMD VF, T.Task and T.PerCoreTask scopes.";
-    TVM_FFI_CHECK(!copy.l2_cache_ctrl.defined(), ValueError)
-        << "FP4 GM->L1 element transpose does not yet support l2_cache_ctrl.";
-    auto require = [](bool condition, const char *detail) {
-      TVM_FFI_CHECK(condition, ValueError)
-          << "FP4 GM->L1 element transpose requires " << detail;
-    };
-    require(copy.dst->dtype == copy.src->dtype,
-            "matching source and destination dtypes");
-    require(copy.src->shape.size() == 2 && copy.dst->shape.size() == 2 &&
-                copy.src_range.size() == 2 && copy.dst_range.size() == 2,
-            "2D source and destination buffers");
-    require(HasCompactTrailingMatrix(copy.src), "a compact source matrix");
-    require(!HasPhysicalLayout(copy.src), "a source without a physical layout");
-    Optional<Layout> layout = LayoutFor(copy.dst);
-    require(layout.defined() && IsCanonicalNZLayout(layout.value(), copy.dst),
-            "a canonical NZ destination");
-    for (size_t axis = 0; axis < 2; ++axis) {
-      require(analyzer_->CanProveEqual(copy.src_range[axis]->min, 0) &&
-                  analyzer_->CanProveEqual(copy.dst_range[axis]->min, 0),
-              "zero-offset source and destination regions");
-      require(analyzer_->CanProveEqual(copy.src_range[axis]->extent,
-                                       copy.src->shape[axis]) &&
-                  analyzer_->CanProveEqual(copy.dst_range[axis]->extent,
-                                           copy.dst->shape[axis]),
-              "regions spanning the full source and destination buffers");
-      require(analyzer_->CanProveEqual(copy.src->shape[axis],
-                                       copy.dst->shape[1 - axis]),
-              "the destination shape to be the transpose of the source");
-    }
-    int64_t rows = RequireStaticInt(copy.dst->shape[0], "FP4 transpose rows");
-    int64_t cols =
-        RequireStaticInt(copy.dst->shape[1], "FP4 transpose columns");
-    require(rows > 0 && cols > 0, "non-empty destination extents");
-    require(rows % 16 == 0, "destination rows divisible by 16");
-    require(cols % 64 == 0, "destination columns divisible by 64");
-    require(analyzer_->CanProveEqual(copy.src->elem_offset, 0) &&
-                analyzer_->CanProveEqual(copy.dst->elem_offset, 0),
-            "zero source and destination element offsets");
-    PrimExpr byte_count = Integer(rows * cols / 2);
-    Buffer source = copy.src;
-    BufferNode *source_node = source.CopyOnWrite();
-    source_node->dtype = DataType::UInt(8);
-    source_node->shape = {byte_count};
-    source_node->strides = {};
-    source_node->elem_offset = Integer(0);
-    Buffer scratch = decl_buffer({byte_count}, DataType::UInt(8),
-                                 "fp4_transpose_nz", "shared.dyn");
-    ICHECK(!pending_allocs_.empty());
-    pending_allocs_.back().push_back(scratch);
-
-    constexpr int kSimtVFLanes = 128;
-    Var thread("fp4_transpose_thread", DataType::Int(32));
-    Var chunk("fp4_transpose_chunk", DataType::Int(32));
-    PrimExpr index = chunk * kSimtVFLanes + thread;
-    // One source byte supplies two destination rows. Reuse both nibbles while
-    // keeping each group of 32 lanes contiguous in the NZ scratch buffer.
-    PrimExpr pair_count = Integer(rows * cols / 4);
-    PrimExpr row = FloorMod(FloorDiv(index, 32), Integer(rows / 2));
-    PrimExpr col =
-        FloorDiv(index, Integer(rows * 16)) * 64 + FloorMod(index, 32) * 2;
-    PrimExpr dst_index = FloorDiv(index, 32) * 64 + FloorMod(index, 32);
-    Var first_byte("fp4_transpose_first_byte", DataType::UInt(32));
-    Var second_byte("fp4_transpose_second_byte", DataType::UInt(32));
-    PrimExpr mask = make_const(DataType::UInt(32), 15);
-    PrimExpr low = bitwise_or(bitwise_and(first_byte, mask),
-                              left_shift(bitwise_and(second_byte, mask), 4));
-    PrimExpr high = bitwise_or(right_shift(first_byte, 4),
-                               left_shift(right_shift(second_byte, 4), 4));
-    Stmt body = SeqStmt({
-        Bind(first_byte,
-             cast(DataType::UInt(32),
-                  BufferLoad(source, {col * Integer(rows / 2) + row}))),
-        Bind(second_byte,
-             cast(DataType::UInt(32),
-                  BufferLoad(source, {(col + 1) * Integer(rows / 2) + row}))),
-        BufferStore(scratch, cast(DataType::UInt(8), low), {dst_index}),
-        BufferStore(scratch, cast(DataType::UInt(8), high), {dst_index + 32}),
-    });
-    body = IfThenElse(index < pair_count, body);
-    body = For(chunk, 0,
-               Integer((rows * cols / 4 + kSimtVFLanes - 1) / kSimtVFLanes),
-               ForKind::kSerial, body);
-    body = AttrStmt(StringImm("simtvf"), "tl.simtvf_scope", Integer(1), body);
-    for (const String &tag : {String("threadIdx.z"), String("threadIdx.y")}) {
-      IterVar axis(Range::FromMinExtent(0, 1),
-                   Var("fp4_transpose_unit", DataType::Int(32)),
-                   IterVarType::kThreadIndex, tag);
-      body = AttrStmt(axis, tirx::attr::thread_extent, Integer(1), body);
-    }
-    IterVar thread_axis(Range::FromMinExtent(0, kSimtVFLanes), thread,
-                        IterVarType::kThreadIndex, "threadIdx.x");
-    body = AttrStmt(thread_axis, tirx::attr::thread_extent,
-                    Integer(kSimtVFLanes), body);
-    body = SBlock({}, {}, {}, "SIMT_VF", body);
-    Array<Range> scratch_range{Range::FromMinExtent(0, byte_count)};
-    Stmt transfer = Evaluate(
-        Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
-             {MakeTLAccessPtr(copy.dst, copy.dst_range, kAccessWrite),
-              MakeTLAccessPtr(scratch, scratch_range, kAccessRead), Integer(0),
-              Integer(1), FloorDiv(byte_count, 32), Integer(0), Integer(0)},
-             {{"single_aiv", Integer(1)}}));
-    return SeqStmt({body, transfer});
-  }
-
   Stmt VisitStmt_(const EvaluateNode *op) final {
     if (inside_simt_vf_)
       return Parent::VisitStmt_(op);
@@ -677,8 +553,6 @@ private:
     if (call == nullptr || !IsAscendCopyCall(call))
       return Parent::VisitStmt_(op);
     AscendCopy copy(call->args, call->annotations);
-    if (std::optional<Stmt> rewritten = RewriteFP4Transpose(copy))
-      return rewritten.value();
     if (std::optional<Stmt> rewritten = RewriteUBToUB(*copy.get()))
       return rewritten.value();
     if (std::optional<Stmt> rewritten = RewriteUBToL1(*copy.get()))
@@ -689,10 +563,6 @@ private:
   Stmt VisitStmt_(const SBlockNode *op) final {
     LayoutMap saved_layout_map = layout_map_;
     bool saved_inside_simt_vf = inside_simt_vf_;
-    bool saved_unsupported_scope = inside_unsupported_scope_;
-    inside_unsupported_scope_ |= op->name_hint == "CUBE" ||
-                                 op->name_hint == "VECTOR" ||
-                                 op->name_hint == "SIMD_VF";
     if (auto layout_map_ref = op->annotations.Get(attr::kLayoutMap)) {
       if (auto map = layout_map_ref.value().as<Map<Buffer, Layout>>())
         layout_map_ = map.value();
@@ -704,7 +574,6 @@ private:
     std::vector<Buffer> pending = std::move(pending_allocs_.back());
     pending_allocs_.pop_back();
     inside_simt_vf_ = saved_inside_simt_vf;
-    inside_unsupported_scope_ = saved_unsupported_scope;
     layout_map_ = std::move(saved_layout_map);
     if (pending.empty())
       return rewritten;
@@ -715,24 +584,9 @@ private:
     return block;
   }
 
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    bool saved = inside_unsupported_scope_;
-    inside_unsupported_scope_ |= op->attr_key == attr::kAscendTask ||
-                                 op->attr_key == attr::kAscendPerCoreTask;
-    if (op->attr_key == tirx::attr::thread_extent) {
-      if (const auto *axis = op->node.as<IterVarNode>())
-        inside_unsupported_scope_ |= axis->thread_tag == "cthread";
-    }
-    Stmt result = Parent::VisitStmt_(op);
-    inside_unsupported_scope_ = saved;
-    return result;
-  }
-
   LayoutMap layout_map_;
   std::vector<std::vector<Buffer>> pending_allocs_;
   bool inside_simt_vf_{false};
-  bool inside_unsupported_scope_{false};
-  bool is_pto_{false};
 };
 
 } // namespace

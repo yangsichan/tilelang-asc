@@ -71,13 +71,6 @@ def test_whole_buffer_transpose_preserves_ascend_copy_geometry(scope):
     assert int(load.args[8]) == 1
 
 
-def test_unrewritten_fp4_gm_to_l1_element_transpose_is_rejected():
-    src = tirx.decl_buffer((128, 64), "float4_e2m1fn", name="src")
-    dst = tirx.decl_buffer((64, 128), "float4_e2m1fn", name="dst", scope="shared.l1")
-    with pytest.raises(ValueError, match="FP4 GM->L1 element transpose must be rewritten"):
-        _lower(src, dst, layouts={dst: make_ascend_nz_layout(dst)}, transpose=True)
-
-
 def test_whole_buffer_copy_accepts_symbolic_transposed_shapes():
     rows = tirx.Var("rows", "int32")
     src = tirx.decl_buffer((2 * rows, 16), "bfloat16", name="src", scope="shared.l1")
@@ -401,8 +394,6 @@ def test_pad_value_is_set_before_the_padded_dma():
         ("float8_e4m3fn", 64, 64, 64, None),
         ("float8_e4m3fn", 64, 48, 48, "m_step to be divisible by 2"),
         ("float8_e4m3fn", 64, 16, 32, "m_step to be divisible by 2"),
-        ("float4_e2m1fn", 64, 64, 64, None),
-        ("float4_e2m1fn", 64, 48, 48, "m_step to be divisible by 4"),
         ("float32", 32, 24, 32, None),
         ("float32", 24, 32, 32, "k_step to be divisible by 2"),
         ("float32", 32, 24, 24, "only covers 3x2"),
