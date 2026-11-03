@@ -87,12 +87,15 @@ struct SyncInsertionSite {
   std::string pipe;
   int domain_id;
   PrimExpr guard{Bool(true)};
+  // Runtime conditions under which this site's task accesses execute. Unlike
+  // `guard`, this excludes loop first/last-iteration refinement terms.
+  PrimExpr activation{Bool(true)};
 
   SyncInsertionSite(IRStructure *path_begin, TaskNode *task, bool at_beginning,
                     CoreMask core, const EpochDomain &domain)
       : path_begin(path_begin), path_end(nullptr), at_beginning(at_beginning),
         core(core), pipe(GetResourcePipeName(task->GetPipeMask())),
-        domain_id(domain.id) {
+        domain_id(domain.id), activation(task->GetConditionGuard()) {
     ICHECK(path_begin != nullptr);
     ICHECK(task != nullptr);
     ICHECK(IsCoreLocalMask(core));
@@ -251,6 +254,14 @@ struct SyncPoint {
   int counter_group_id;
   size_t allocation_index;
   std::optional<CounterChannelKey> counter_channel;
+  // Activation metadata (plain data dependencies only): the hazard predicate
+  // over the analysis scope's loop variable, indexed by the producer round.
+  // guard_valid additionally marks that emitting it as a statement guard is
+  // sound (d == 0, non-counter).
+  PrimExpr activation{Bool(true)};
+  ControlNode *activation_scope{nullptr};
+  bool activation_valid{false};
+  bool guard_valid{false};
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -631,6 +642,199 @@ private:
 // Dependency analysis model and closure optimization
 // ============================================================================
 
+// Round-indexed activation arithmetic: resolves hoisted condition binds
+// (e.g. `__cond_0 = i % 2 == 0`) into predicates over the scope's loop
+// variable, and evaluates them at round offsets. Unresolvable guards yield
+// nullopt; callers treat that as unknown (conservative).
+class RoundShiftContext {
+public:
+  explicit RoundShiftContext(ControlNode *scope) : scope_(scope) {
+    if (scope_ == nullptr || !scope_->control.defined())
+      return;
+    loop_var_ = Downcast<Var>(PrimExpr(scope_->control->loop_var));
+    // Bind targets surface through GetWriteVars; plain BufferStore targets do
+    // not, so scan for them explicitly -- a guard reading a store-written
+    // buffer drifts across rounds and must be rejected.
+    for (const Var &var : scope_->GetWriteVars())
+      written_vars_.insert(var);
+    CollectBinds(scope_);
+    CollectStores(scope_);
+  }
+
+  // Free variables besides the loop variable must be round-invariant: runtime
+  // scalar parameters qualify, variables written in the scope do not (their
+  // drift would break round shifts). Buffer-load storages are scanned
+  // explicitly since UndefinedVars may not surface them.
+  std::optional<PrimExpr> Resolve(const PrimExpr &guard) const {
+    if (!guard.defined())
+      return std::nullopt;
+    PrimExpr resolved = guard;
+    if (scope_ != nullptr) {
+      for (int round = 0; round < 8; ++round) {
+        Map<Var, PrimExpr> substitutions;
+        for (const Var &var : tirx::UndefinedVars(resolved)) {
+          auto definition = binds_.find(var);
+          if (definition != binds_.end())
+            substitutions.Set(var, definition->second);
+        }
+        if (substitutions.empty())
+          break;
+        resolved = tirx::Substitute(resolved, substitutions);
+      }
+    }
+    for (const Var &var : FreeVars(resolved)) {
+      if (scope_ != nullptr && var.same_as(loop_var_))
+        continue;
+      if (scope_ == nullptr || written_vars_.count(var))
+        return std::nullopt;
+    }
+    return analyzer_.Simplify(resolved);
+  }
+
+  // Evaluate a resolved predicate `distance` rounds later.
+  std::optional<PrimExpr> Shift(const PrimExpr &resolved, int distance) const {
+    if (distance == 0)
+      return resolved;
+    if (scope_ == nullptr)
+      return std::nullopt;
+    Map<Var, PrimExpr> substitutions;
+    substitutions.Set(loop_var_,
+                       loop_var_ + IntImm(loop_var_->dtype, distance));
+    return analyzer_.Simplify(tirx::Substitute(resolved, substitutions));
+  }
+
+private:
+  // Free variables of the expression plus buffer-load storage variables.
+  static ffi::Array<Var> FreeVars(const PrimExpr &expr) {
+    ffi::Array<Var> vars = tirx::UndefinedVars(expr);
+    class LoadCollector : public StmtExprVisitor {
+    public:
+      std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> loads;
+      void VisitExpr_(const BufferLoadNode *op) final {
+        loads.insert(op->buffer->data);
+        StmtExprVisitor::VisitExpr_(op);
+      }
+    } collector;
+    collector(Evaluate(expr));
+    for (const Var &var : collector.loads)
+      vars.push_back(var);
+    return vars;
+  }
+
+  void CollectBinds(IRStructure *node) {
+    if (node == nullptr)
+      return;
+    if (node->IsControl()) {
+      for (const auto &child : static_cast<ControlNode *>(node)->children)
+        CollectBinds(child.get());
+    } else if (node->IsTask()) {
+      CollectStmtBinds(static_cast<TaskNode *>(node)->stmt);
+    }
+  }
+
+  void CollectStores(IRStructure *node) {
+    if (node == nullptr)
+      return;
+    if (node->IsControl()) {
+      for (const auto &child : static_cast<ControlNode *>(node)->children)
+        CollectStores(child.get());
+    } else if (node->IsTask()) {
+      CollectStmtStores(static_cast<TaskNode *>(node)->stmt);
+    }
+  }
+
+  void CollectStmtStores(const Stmt &stmt) {
+    if (const auto *store = stmt.as<BufferStoreNode>()) {
+      written_vars_.insert(store->buffer->data);
+      return;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq)
+        CollectStmtStores(child);
+      return;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      CollectStmtStores(attr->body);
+      return;
+    }
+    if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      CollectStmtStores(branch->then_case);
+      if (branch->else_case.defined())
+        CollectStmtStores(branch->else_case.value());
+      return;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      CollectStmtStores(loop->body);
+      return;
+    }
+    if (const auto *loop = stmt.as<WhileNode>()) {
+      CollectStmtStores(loop->body);
+      return;
+    }
+  }
+
+  void CollectStmtBinds(const Stmt &stmt) {
+    if (const auto *bind = stmt.as<BindNode>()) {
+      binds_.emplace(bind->var, bind->value);
+      return;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq)
+        CollectStmtBinds(child);
+      return;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      CollectStmtBinds(attr->body);
+      return;
+    }
+    if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      CollectStmtBinds(branch->then_case);
+      if (branch->else_case.defined())
+        CollectStmtBinds(branch->else_case.value());
+      return;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      CollectStmtBinds(loop->body);
+      return;
+    }
+    if (const auto *loop = stmt.as<WhileNode>()) {
+      CollectStmtBinds(loop->body);
+      return;
+    }
+  }
+
+  ControlNode *scope_{nullptr};
+  Var loop_var_;
+  std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual> binds_;
+  // Variables written inside the scope: guards reading them cannot shift.
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> written_vars_;
+  mutable arith::Analyzer analyzer_;
+};
+
+// Guard conjunction with structural-duplicate folding: Simplify can return
+// distinct clones of the same predicate, which And(x, x) would not fold by
+// pointer, breaking downstream structural implication checks.
+PrimExpr ConjoinGuards(const PrimExpr &a, const PrimExpr &b) {
+  if (is_one(a))
+    return b;
+  if (is_one(b))
+    return a;
+  if (GuardsEquivalent(a, b, ConstrSet()))
+    return a;
+  return a && b;
+}
+
+// Compose activations of two path-adjacent edges: `first` starts at round t,
+// `second` at t + second_offset; result is a predicate over t.
+template <typename ShiftFn>
+PrimExpr ComposeActivations(const PrimExpr &first, const PrimExpr &second,
+                            int second_offset, const ShiftFn &shift) {
+  PrimExpr composed = second;
+  if (second_offset != 0)
+    composed = shift(second, second_offset);
+  return ConjoinGuards(first, composed);
+}
+
 class DepClosure {
 public:
   DepClosure() = default;
@@ -656,32 +860,56 @@ public:
     return result;
   }
 
-  void Insert(const DepEdge &edge) {
+  void Insert(const DepEdge &edge) { Insert(edge, Bool(true)); }
+
+  void Insert(const DepEdge &edge, const PrimExpr &activation) {
     if (!present_.insert(edge).second)
       return;
     ICHECK_LT(std::max(edge.src, edge.dst), outgoing_.size());
     edges_.push_back(edge);
     outgoing_[edge.src].push_back(edge);
     incoming_[edge.dst].push_back(edge);
+    activation_.emplace(edge, activation);
   }
 
-  template <typename Projector>
-  void Saturate(const DepEdge &start, int max_distance,
+  // Activation of an inserted edge, as a predicate at its start round.
+  const PrimExpr *FindActivation(const DepEdge &edge) const {
+    auto it = activation_.find(edge);
+    return it == activation_.end() ? nullptr : &it->second;
+  }
+
+  template <typename Visitor>
+  void ForEachEdge(size_t src, size_t dst, int distance,
+                   const Visitor &visit) const {
+    if (src >= outgoing_.size())
+      return;
+    for (const DepEdge &edge : outgoing_[src]) {
+      if (edge.dst == dst && edge.distance == distance)
+        visit(edge);
+    }
+  }
+
+  template <typename ShiftFn, typename Projector>
+  void Saturate(const DepEdge &start, const PrimExpr &start_activation,
+                int max_distance, const ShiftFn &shift,
                 const Projector &project) {
     if (start.distance > max_distance)
       return;
-    std::vector<DepEdge> work;
+    std::vector<std::pair<DepEdge, PrimExpr>> work;
     std::set<DepEdge> pending;
-    auto enqueue_one = [&](const DepEdge &edge) {
+    auto enqueue_one = [&](const DepEdge &edge, const PrimExpr &activation) {
       if (edge.distance <= max_distance && !Contains(edge) &&
           pending.insert(edge).second) {
-        work.push_back(edge);
+        work.push_back({edge, activation});
       }
     };
-    auto enqueue = [&](const DepEdge &edge) { project(edge, enqueue_one); };
-    enqueue(start);
+    auto enqueue = [&](const DepEdge &edge, const PrimExpr &activation) {
+      project(edge, activation, enqueue_one);
+    };
+    enqueue(start, start_activation);
     while (!work.empty()) {
-      DepEdge edge = work.back();
+      DepEdge edge = work.back().first;
+      PrimExpr activation = work.back().second;
       work.pop_back();
       if (Contains(edge)) {
         pending.erase(edge);
@@ -690,27 +918,44 @@ public:
       for (const DepEdge &other : outgoing_[edge.dst]) {
         int distance = edge.distance + other.distance;
         if (distance <= max_distance) {
+          const PrimExpr *other_activation = FindActivation(other);
+          PrimExpr composed = activation;
+          if (other_activation != nullptr)
+            composed = ComposeActivations(
+                activation, *other_activation, edge.distance, shift);
           enqueue(DepEdge(edge.src, other.dst, distance,
-                          edge.strict || other.strict));
+                          edge.strict || other.strict),
+                 composed);
         }
       }
       for (const DepEdge &other : incoming_[edge.src]) {
         int distance = other.distance + edge.distance;
         if (distance <= max_distance) {
+          const PrimExpr *other_activation = FindActivation(other);
+          PrimExpr composed = activation;
+          if (other_activation != nullptr)
+            composed = ComposeActivations(
+                *other_activation, activation, other.distance, shift);
           enqueue(DepEdge(other.src, edge.dst, distance,
-                          other.strict || edge.strict));
+                          other.strict || edge.strict),
+                 composed);
         }
       }
       pending.erase(edge);
-      Insert(edge);
+      Insert(edge, activation);
     }
   }
 
   DepClosure DistanceZero() const {
     DepClosure result(outgoing_.size());
     for (const DepEdge &edge : edges_) {
-      if (edge.distance == 0)
-        result.Insert(edge);
+      if (edge.distance == 0) {
+        auto it = activation_.find(edge);
+        if (it != activation_.end())
+          result.Insert(edge, it->second);
+        else
+          result.Insert(edge);
+      }
     }
     return result;
   }
@@ -720,12 +965,18 @@ public:
 private:
   std::vector<DepEdge> edges_;
   std::set<DepEdge> present_;
+  // First activation per edge wins; later, wider derivations are dropped
+  // (only makes covering queries conservative).
+  std::map<DepEdge, PrimExpr> activation_;
   std::vector<std::vector<DepEdge>> outgoing_;
   std::vector<std::vector<DepEdge>> incoming_;
 };
 
 struct SyncAnalysisResult {
   DepClosure closure;
+  // Activation-qualified view for OptimizeSyncPoints only; the strict closure
+  // serves completion/lifetime/flag-version/counter consumers.
+  DepClosure covering_closure;
   std::vector<VisibleSyncPoint> visible_sync_points;
 };
 
@@ -1007,7 +1258,9 @@ private:
 
   SyncAnalysisResult AnalyzeNodeList(const std::vector<IRStructure *> &nodes,
                                      ControlNode *loop) {
-    SyncAnalysisResult result{DepClosure(site_registry_.Size()), {}};
+    SyncAnalysisResult result{DepClosure(site_registry_.Size()),
+                              DepClosure(site_registry_.Size()), {}};
+    RoundShiftContext shift_ctx(loop);
     std::vector<size_t> task_site_ids = site_registry_.CollectSiteIds(nodes);
 
     std::vector<std::vector<VisibleSyncPoint>> child_sync_points;
@@ -1022,8 +1275,12 @@ private:
     for (const SyncPoint &sync_point : local_sync_points)
       max_distance = std::max(max_distance, sync_point.edge.distance);
 
-    AddSamePipeEdges(result.closure, task_site_ids, max_distance, loop);
-    OptimizeSyncPoints(local_sync_points, result.closure, max_distance, loop);
+    AddSamePipeEdges(result.closure, task_site_ids, max_distance, loop,
+                     nullptr, false);
+    AddSamePipeEdges(result.covering_closure, task_site_ids, max_distance, loop,
+                     &shift_ctx, true);
+    OptimizeSyncPoints(local_sync_points, result.closure, result.covering_closure,
+                       max_distance, loop, &shift_ctx);
     if (loop != nullptr)
       OptimizeFlagVersions(local_sync_points, result.closure, loop);
 
@@ -1058,18 +1315,21 @@ private:
     RecordLifetimeOrder(task_site_ids, loop, result.closure);
     if (loop != nullptr)
       scope_closures_.insert_or_assign(loop, result.closure);
+    result.covering_closure = result.covering_closure.DistanceZero();
     result.closure = result.closure.DistanceZero();
     return result;
   }
 
   SyncAnalysisResult AnalyzeNode(IRStructure *node) {
     if (node == nullptr)
-      return {DepClosure(site_registry_.Size()), {}};
+      return {DepClosure(site_registry_.Size()),
+              DepClosure(site_registry_.Size()), {}};
 
     if (node->IsControl()) {
       auto *control = static_cast<ControlNode *>(node);
       if (control->children.empty() || !control->control.defined())
-        return {DepClosure(site_registry_.Size()), {}};
+        return {DepClosure(site_registry_.Size()),
+                DepClosure(site_registry_.Size()), {}};
 
       std::vector<IRStructure *> nodes;
       for (const std::shared_ptr<IRStructure> &child : control->children)
@@ -1090,10 +1350,12 @@ private:
     }
 
     if (node->IsTask())
-      return {DepClosure(site_registry_.Size()), {}};
+      return {DepClosure(site_registry_.Size()),
+              DepClosure(site_registry_.Size()), {}};
 
     LOG(FATAL) << "Unknown IRStructure kind in SyncAnalyzer";
-    return {DepClosure(site_registry_.Size()), {}};
+    return {DepClosure(site_registry_.Size()),
+            DepClosure(site_registry_.Size()), {}};
   }
 
   size_t CounterAccessSite(const MultiBufferInfo &info,
@@ -1419,6 +1681,10 @@ private:
     return sync_points;
   }
 
+  // Promotes a child scope's STRICT closure into the parent scope. The
+  // covering closure is deliberately not promoted: child activations are
+  // indexed on the child's rounds and cannot be soundly re-indexed; do not
+  // restore a covering promotion without a sound round re-indexing.
   void AddPromotedChildClosure(DepClosure &out, IRStructure *child,
                                const DepClosure &child_closure,
                                ControlNode *projection_scope) const {
@@ -1445,8 +1711,9 @@ private:
                                        projection_scope)) {
           return;
         }
-        SaturateDependencyEdge(out, parent,
-                               /*max_distance=*/0, projection_scope);
+        SaturateDependencyEdge(out, parent, Bool(true),
+                               /*max_distance=*/0, projection_scope, nullptr,
+                               /*relaxed=*/false);
       });
     }
   }
@@ -1488,7 +1755,9 @@ private:
 
   void AddSamePipeEdges(DepClosure &closure,
                         const std::vector<size_t> &task_sites, int max_distance,
-                        ControlNode *projection_scope) const {
+                        ControlNode *projection_scope,
+                        const RoundShiftContext *shift_ctx,
+                        bool with_activation) const {
     const SyncInsertionSiteList &sites = site_registry_.Sites();
     using PipeDomainKey = std::tuple<CoreMask, std::string, int>;
     std::map<PipeDomainKey, std::vector<size_t>> by_pipe;
@@ -1516,9 +1785,16 @@ private:
           min_distance = std::max(min_distance, 0);
           for (int distance = min_distance; distance <= max_distance;
                ++distance) {
-            SaturateDependencyEdge(closure,
-                                   DepEdge(lhs_id, rhs_id, distance, false),
-                                   max_distance, projection_scope);
+            DepEdge edge(lhs_id, rhs_id, distance, false);
+            PrimExpr activation = Bool(true);
+            if (with_activation) {
+              auto hazard = EdgeHazardActivation(edge, projection_scope,
+                                                  shift_ctx);
+              activation = hazard.value_or(Bool(false));
+            }
+            SaturateDependencyEdge(closure, edge, activation, max_distance,
+                                   projection_scope, shift_ctx,
+                                   /*relaxed=*/with_activation);
           }
         }
       }
@@ -1526,43 +1802,208 @@ private:
   }
 
   void SaturateDependencyEdge(DepClosure &closure, const DepEdge &edge,
-                              int max_distance,
-                              ControlNode *projection_scope) const {
-    closure.Saturate(
-        edge, max_distance, [&](const DepEdge &candidate, const auto &visit) {
-          if (candidate.distance != 0 && candidate.distance != 1) {
-            visit(candidate);
-            return;
-          }
-          int source_domain = site_registry_.Src(candidate).EpochDomainId();
-          site_registry_.ForEachPhysicalSitePair(
-              candidate, [&](const DepEdge &projected) {
-                int target_domain =
-                    site_registry_.Src(projected).EpochDomainId();
-                // Same-iteration ordering projects into a narrower active
-                // guard. Unit-distance ordering additionally requires both
-                // domains to describe the same active-epoch sequence.
-                bool can_project =
-                    domains_.CanProjectDomain(source_domain, target_domain,
-                                              projection_scope) &&
-                    (candidate.distance == 0 ||
-                     domains_.CanProjectDomain(target_domain, source_domain,
-                                               projection_scope));
-                if (can_project) {
-                  visit(projected);
-                }
-              });
-        });
+                              const PrimExpr &activation, int max_distance,
+                              ControlNode *projection_scope,
+                              const RoundShiftContext *shift_ctx,
+                              bool relaxed) const {
+    auto projector = [&](const DepEdge &candidate,
+                         const PrimExpr &candidate_activation,
+                         const auto &visit) {
+      if (candidate.distance != 0 && candidate.distance != 1) {
+        visit(candidate, candidate_activation);
+        return;
+      }
+      int source_domain = site_registry_.Src(candidate).EpochDomainId();
+      site_registry_.ForEachPhysicalSitePair(
+          candidate, [&](const DepEdge &projected) {
+            int target_domain = site_registry_.Src(projected).EpochDomainId();
+            // Same-iteration ordering projects into a narrower active
+            // guard. Unit-distance ordering additionally requires both
+            // domains to describe the same active-epoch sequence.
+            bool can_project =
+                domains_.CanProjectDomain(source_domain, target_domain,
+                                          projection_scope) &&
+                (candidate.distance == 0 ||
+                 domains_.CanProjectDomain(target_domain, source_domain,
+                                           projection_scope));
+            if (!can_project && relaxed) {
+              // Relaxed pass: the projected edge re-expresses the same
+              // guarantee at another domain variant of the same positions;
+              // soundness of eliminations is the query-time implication
+              // hazard => chain activation, not a domain guard implication.
+              can_project = true;
+            }
+            if (can_project) {
+              visit(projected, candidate_activation);
+            }
+          });
+    };
+    if (shift_ctx != nullptr) {
+      auto real_shift = [shift_ctx](const PrimExpr &expr, int distance) {
+        return shift_ctx->Shift(expr, distance).value_or(Bool(false));
+      };
+      closure.Saturate(edge, activation, max_distance, real_shift, projector);
+      return;
+    }
+    // Inert shift for callers without a context: only degrades unused
+    // bookkeeping (strict) or stays conservative (root-scope relaxed).
+    auto inert_shift = [](const PrimExpr &, int) { return Bool(false); };
+    closure.Saturate(edge, activation, max_distance, inert_shift, projector);
+  }
+
+  // Resolved hazard activation: producer at round t, consumer at t + distance.
+  // nullopt when endpoint guards are not expressible over the loop variable.
+  std::optional<PrimExpr>
+  EdgeHazardActivation(const DepEdge &edge, ControlNode *scope,
+                       const RoundShiftContext *ctx) const {
+    const SyncInsertionSite &src = site_registry_.Src(edge);
+    const SyncInsertionSite &dst = site_registry_.Dst(edge);
+    std::optional<PrimExpr> src_act;
+    std::optional<PrimExpr> dst_act;
+    if (ctx != nullptr) {
+      src_act = ctx->Resolve(src.activation);
+      dst_act = ctx->Resolve(dst.activation);
+    } else {
+      if (tirx::UndefinedVars(src.activation).empty())
+        src_act = src.activation;
+      if (tirx::UndefinedVars(dst.activation).empty())
+        dst_act = dst.activation;
+    }
+    if (!src_act.has_value() || !dst_act.has_value())
+      return std::nullopt;
+    PrimExpr consumer = *dst_act;
+    if (edge.distance > 0) {
+      if (ctx == nullptr)
+        return std::nullopt;
+      auto shifted = ctx->Shift(*dst_act, edge.distance);
+      if (!shifted.has_value())
+        return std::nullopt;
+      consumer = *shifted;
+    }
+    return arith::Analyzer().Simplify(*src_act && consumer);
+  }
+
+  // True when the hazard provably never co-occurs.
+  bool ProvablyInactive(const PrimExpr &hazard, ControlNode *scope) const {
+    arith::Analyzer analyzer;
+    analyzer.z3_prover.SetRLimit(50000);
+    if (scope != nullptr)
+      scope->GetLoopBodyContext().Populate(analyzer);
+    if (is_zero(analyzer.Simplify(hazard)))
+      return true;
+    PrimExpr negated = Not(hazard);
+    return is_one(analyzer.Simplify(negated)) ||
+           analyzer.CanProve(negated) ||
+           analyzer.z3_prover.CanProve(negated);
+  }
+
+  // Covering: a strict chain between the endpoints enforces the ordering on
+  // every round the hazard needs (hazard => chain activation).
+  bool CoveredByActivation(const DepClosure &covering, const DepEdge &edge,
+                           const PrimExpr &hazard,
+                           ControlNode *scope) const {
+    ConstrSet proof_ctx =
+        scope != nullptr ? scope->GetLoopBodyContext() : ConstrSet();
+    bool covered = false;
+    covering.ForEachEdge(edge.src, edge.dst, edge.distance,
+                         [&](const DepEdge &candidate) {
+                           if (covered || !candidate.strict)
+                             return;
+                           const PrimExpr *activation =
+                               covering.FindActivation(candidate);
+                           if (activation == nullptr)
+                             return;
+                           if (GuardImplies(hazard, *activation, proof_ctx))
+                             covered = true;
+                         });
+    return covered;
+  }
+
+  // Activation eligibility and resolved hazard for a data edge (ISSUES.md
+  // §2.6): d == 0 needs any nontrivial endpoint guard; d >= 1 needs exactly
+  // one unguarded endpoint (otherwise the edge conservatively stands in for
+  // wider, active-adjacent hazards, e.g. the counter-ring pattern).
+  struct ActivationEligibility {
+    std::optional<PrimExpr> hazard;
+    bool equivalent{false};
+  };
+
+  ActivationEligibility
+  CoveringEligibility(const DepEdge &edge, ControlNode *scope,
+                      const RoundShiftContext *ctx) const {
+    ActivationEligibility result;
+    const SyncInsertionSite &src = site_registry_.Src(edge);
+    const SyncInsertionSite &dst = site_registry_.Dst(edge);
+    std::optional<PrimExpr> src_act;
+    std::optional<PrimExpr> dst_act;
+    if (ctx != nullptr) {
+      src_act = ctx->Resolve(src.activation);
+      dst_act = ctx->Resolve(dst.activation);
+    } else {
+      if (tirx::UndefinedVars(src.activation).empty())
+        src_act = src.activation;
+      if (tirx::UndefinedVars(dst.activation).empty())
+        dst_act = dst.activation;
+    }
+    if (!src_act.has_value() || !dst_act.has_value())
+      return result;
+    bool src_one = is_one(*src_act);
+    bool dst_one = is_one(*dst_act);
+    if (src_one && dst_one)
+      return result; // ordinary unguarded edge
+    ConstrSet proof_ctx =
+        scope != nullptr ? scope->GetLoopBodyContext() : ConstrSet();
+    result.equivalent = GuardsEquivalent(*src_act, *dst_act, proof_ctx);
+    if (edge.distance == 0) {
+      result.hazard = arith::Analyzer().Simplify(
+          ConjoinGuards(*src_act, *dst_act));
+    } else if (edge.distance > 0 && src_one != dst_one) {
+      const PrimExpr &guarded = src_one ? *dst_act : *src_act;
+      std::optional<PrimExpr> shifted;
+      if (src_one) {
+        if (ctx == nullptr)
+          return result;
+        shifted = ctx->Shift(guarded, edge.distance);
+      } else {
+        shifted = guarded; // producer-indexed already
+      }
+      if (!shifted.has_value())
+        return result;
+      result.hazard = arith::Analyzer().Simplify(*shifted);
+    }
+    return result;
   }
 
   void OptimizeSyncPoints(std::vector<SyncPoint> &sync_points,
-                          DepClosure &closure, int max_distance,
-                          ControlNode *projection_scope) const {
+                          DepClosure &closure, DepClosure &covering,
+                          int max_distance, ControlNode *projection_scope,
+                          const RoundShiftContext *shift_ctx) const {
+    // Pass 1 keeps today's semantics exactly: strict containment elimination,
+    // strict saturation, the owner-exclusion invariant, plus activation
+    // metadata. No edge is dropped here, so the strict closure stays
+    // structurally identical to the pre-change pipeline.
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
       if (closure.Contains(sync_point.edge))
         continue;
+      if (sync_point.dependency_kind == DependencyKind::kData) {
+        ActivationEligibility eligibility =
+            CoveringEligibility(sync_point.edge, projection_scope, shift_ctx);
+        if (eligibility.hazard.has_value() && !is_one(*eligibility.hazard)) {
+          bool is_counter = sync_point.counter_group_id != 0;
+          sync_point.activation = *eligibility.hazard;
+          sync_point.activation_scope = projection_scope;
+          sync_point.activation_valid = true;
+          // Counter points are never dropped or statement-guarded (version
+          // ring pairing contract). Same-round points may carry the hazard as
+          // a statement guard: skipped rounds have no same-round hazard, and
+          // cross-round visibility rides the active-round firing plus
+          // same-pipe in-order issue.
+          sync_point.guard_valid =
+              !is_counter && sync_point.edge.distance == 0;
+        }
+      }
       if (sync_point.dependency_kind == DependencyKind::kOwnerExclusion &&
           sync_point.edge.distance != 0 && sync_point.edge.distance != 1) {
         LOG(FATAL) << "InsertSync cannot materialize an uncovered multi-buffer "
@@ -1570,11 +2011,55 @@ private:
                    << sync_point.edge.distance << " (paired distance "
                    << 1 - sync_point.edge.distance << ")";
       }
-      SaturateDependencyEdge(closure, sync_point.edge, max_distance,
-                             projection_scope);
+      SaturateDependencyEdge(closure, sync_point.edge, Bool(true), max_distance,
+                             projection_scope, nullptr, /*relaxed=*/false);
       emit.push_back(std::move(sync_point));
     }
-    sync_points = std::move(emit);
+
+    // Drop edges whose hazard provably never co-occurs (never counter
+    // points). Runs after pass-1 so dropped edges still saturate the strict
+    // closure; all output-reducing decisions live on the covering side.
+    emit.erase(std::remove_if(
+                   emit.begin(), emit.end(),
+                   [&](const SyncPoint &sync_point) {
+                     return sync_point.activation_valid &&
+                            sync_point.counter_group_id == 0 &&
+                            ProvablyInactive(sync_point.activation,
+                                             projection_scope);
+                   }),
+               emit.end());
+
+    // Pass 2: activation-qualified covering. Chain-segment-first order
+    // (smaller distance, earlier consumer, later producer) saturates a
+    // shortcut's segments before it is queried; each candidate is queried
+    // before its own edge enters the closure, so it can never cover itself.
+    std::stable_sort(emit.begin(), emit.end(),
+                     [](const SyncPoint &lhs, const SyncPoint &rhs) {
+                       if (lhs.edge.distance != rhs.edge.distance)
+                         return lhs.edge.distance < rhs.edge.distance;
+                       if (lhs.edge.dst != rhs.edge.dst)
+                         return lhs.edge.dst < rhs.edge.dst;
+                       return lhs.edge.src > rhs.edge.src;
+                     });
+    std::vector<SyncPoint> final_emit;
+    for (SyncPoint &sync_point : emit) {
+      // Counter points are never eliminated by covering (ring seed/drain
+      // pairing); they serve as chain segments only.
+      bool is_counter = sync_point.counter_group_id != 0;
+      if (!is_counter && sync_point.activation_valid &&
+          CoveredByActivation(covering, sync_point.edge,
+                              sync_point.activation, projection_scope)) {
+        continue;
+      }
+      if (sync_point.activation_valid) {
+        SaturateDependencyEdge(covering, sync_point.edge,
+                               sync_point.activation, max_distance,
+                               projection_scope, shift_ctx, /*relaxed=*/true);
+      }
+      final_emit.push_back(std::move(sync_point));
+    }
+    std::stable_sort(final_emit.begin(), final_emit.end());
+    sync_points = std::move(final_emit);
   }
 
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
@@ -2413,6 +2898,15 @@ private:
       std::string consumer_pipe = "PIPE_" + hard_event.substr(separator + 1);
       PrimExpr producer_guard = src.GetGuard();
       PrimExpr consumer_guard = dst.GetGuard();
+
+      // Activation guards: d == 0 points on a single-version (constant event
+      // id) flag fire only on rounds where the hazard co-occurs. Other points
+      // keep today's unconditional form (ISSUES.md §2.6).
+      if (sync_point.guard_valid &&
+          sync_point.edge.distance == 0 && sync_point.num_versions == 1) {
+        producer_guard = producer_guard && sync_point.activation;
+        consumer_guard = consumer_guard && sync_point.activation;
+      }
 
       if (!site_registry_.IsCrossCore(sync_point) &&
           producer_pipe == consumer_pipe) {
