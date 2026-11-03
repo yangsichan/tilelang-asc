@@ -11,25 +11,27 @@
 
 namespace tvm::tl {
 
-inline int64_t Nd2NzElementBytes(const PrimExpr &expr) {
+inline int64_t Nd2NzElementBits(const PrimExpr &expr) {
   const auto *dtype = expr.as<tirx::StringImmNode>();
-  if (dtype && dtype->value == "fp8_e4_t")
-    return 1;
-  if (dtype && dtype->value == "float")
+  if (dtype && dtype->value == "float4_e2m1x2_t")
     return 4;
+  if (dtype && dtype->value == "fp8_e4_t")
+    return 8;
+  if (dtype && dtype->value == "float")
+    return 32;
   if (dtype && (dtype->value == "half" || dtype->value == "bfloat16_t"))
-    return 2;
-  TVM_FFI_THROW(ValueError)
-      << "ND2NZ dtype must be half, bfloat16_t, float, or fp8_e4_t, got "
-      << expr;
+    return 16;
+  TVM_FFI_THROW(ValueError) << "ND2NZ dtype must be half, bfloat16_t, float, "
+                               "fp8_e4_t, or float4_e2m1x2_t, got "
+                            << expr;
   return 0;
 }
 
 struct Nd2NzGeometry {
-  int64_t rows, cols, src_pitch, dst_pitch, src_bytes, dst_bytes;
+  int64_t rows, cols, src_pitch, dst_pitch, src_bits, dst_bits;
 
   bool Empty() const { return rows == 0 || cols == 0; }
-  int64_t Bursts() const { return cols / (32 / dst_bytes); }
+  int64_t Bursts() const { return cols / (256 / dst_bits); }
   int64_t SpanBytes(int64_t pitch) const {
     return Empty() ? 0 : ((Bursts() - 1) * pitch + rows) * 32;
   }
@@ -51,11 +53,11 @@ inline Nd2NzGeometry ParseNd2NzGeometry(const tirx::CallNode *op,
                   integer(3, "cols"),
                   scatter ? 0 : integer(4, "src_pitch"),
                   integer(scatter ? 4 : 5, "dst_pitch"),
-                  Nd2NzElementBytes(op->args[scatter ? 5 : 6]),
-                  Nd2NzElementBytes(op->args[6])};
+                  Nd2NzElementBits(op->args[scatter ? 5 : 6]),
+                  Nd2NzElementBits(op->args[6])};
   if (g.Empty())
     return g;
-  if (g.cols % (32 / g.dst_bytes) != 0 || g.dst_pitch < g.rows ||
+  if (g.cols % (256 / g.dst_bits) != 0 || g.dst_pitch < g.rows ||
       (!scatter && g.src_pitch < g.rows))
     TVM_FFI_THROW(ValueError)
         << "ND2NZ requires C0-aligned columns and pitches >= rows";
@@ -69,13 +71,13 @@ inline Nd2NzGeometry ParseNd2NzGeometry(const tirx::CallNode *op,
         << "ND2NZ geometry exceeds instruction field range";
   if (scatter &&
       (g.rows % 16 != 0 ||
-       (g.src_bytes == 4 && g.dst_bytes == 2 && g.cols % 64 != 0) ||
-       (g.src_bytes == 2 && g.dst_bytes == 4 && g.cols % 128 != 0) ||
+       (g.src_bits == 32 && g.dst_bits == 16 && g.cols % 64 != 0) ||
+       (g.src_bits == 16 && g.dst_bits == 32 && g.cols % 128 != 0) ||
        (op->args[5].as<tirx::StringImmNode>()->value !=
             op->args[6].as<tirx::StringImmNode>()->value &&
-        !(g.src_bytes == 4 &&
+        !(g.src_bits == 32 &&
           op->args[6].as<tirx::StringImmNode>()->value == "bfloat16_t") &&
-        !(g.dst_bytes == 4 &&
+        !(g.dst_bits == 32 &&
           op->args[5].as<tirx::StringImmNode>()->value == "bfloat16_t"))))
     TVM_FFI_THROW(ValueError)
         << "Unsupported ND2NZ scatter shape or dtype conversion";

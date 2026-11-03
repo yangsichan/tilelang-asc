@@ -33,20 +33,22 @@ using namespace tirx::transform;
 
 namespace {
 
-std::string Nd2NzDTypeName(DataType dtype, bool allow_e4m3 = false) {
+std::string Nd2NzDTypeName(DataType dtype, bool allow_low_precision = false) {
   if (dtype.is_bfloat16())
     return "bfloat16_t";
   if (dtype.is_float16())
     return "half";
   if (dtype.is_float() && dtype.bits() == 32)
     return "float";
-  if (allow_e4m3 && dtype.is_float8_e4m3fn())
+  if (allow_low_precision && dtype.is_float8_e4m3fn())
     return "fp8_e4_t";
+  if (allow_low_precision && dtype.is_float4_e2m1fn())
+    return "float4_e2m1x2_t";
   TVM_FFI_THROW(ValueError)
       << "Unsupported nd2nz dtype: " << dtype
       << ". Supported types: float16/bfloat16/float32"
-      << (allow_e4m3 ? "/float8_e4m3fn" : "")
-      << ". E4M3 is supported for ND or NZ UB->NZ L1 copies.";
+      << (allow_low_precision ? "/float8_e4m3fn/float4_e2m1fn" : "")
+      << ". E4M3/FP4 are supported for ND or NZ UB->NZ L1 copies.";
   return "";
 }
 
@@ -163,10 +165,9 @@ private:
       offset = offset + cast(index_dtype, ranges[axis]->min) * stride;
       compact_stride = compact_stride * cast(index_dtype, buffer->shape[axis]);
     }
-    PrimExpr element_bytes =
-        make_const(index_dtype, (buffer->dtype.bits() + 7) / 8);
-    PrimExpr alignment = make_const(index_dtype, 32);
-    return analyzer_->CanProveEqual(FloorMod(offset * element_bytes, alignment),
+    PrimExpr element_bits = make_const(index_dtype, buffer->dtype.bits());
+    PrimExpr alignment = make_const(index_dtype, 256);
+    return analyzer_->CanProveEqual(FloorMod(offset * element_bits, alignment),
                                     make_const(index_dtype, 0));
   }
 
@@ -191,17 +192,18 @@ private:
 
   std::pair<std::string, std::string>
   ValidateScatterTemplate(const Buffer &src, const Buffer &dst, int64_t rows,
-                          int64_t cols, bool allow_e4m3 = false) const {
-    std::string src_dtype = Nd2NzDTypeName(src->dtype, allow_e4m3);
-    std::string dst_dtype = Nd2NzDTypeName(dst->dtype, allow_e4m3);
+                          int64_t cols,
+                          bool allow_low_precision = false) const {
+    std::string src_dtype = Nd2NzDTypeName(src->dtype, allow_low_precision);
+    std::string dst_dtype = Nd2NzDTypeName(dst->dtype, allow_low_precision);
     if (rows % 16 != 0) {
       TVM_FFI_THROW(ValueError)
           << "UB ND->NZ scatter requires rows divisible by 16, got " << rows
           << ".";
     }
     if (src_dtype == dst_dtype) {
-      int element_bytes = (src->dtype.bits() + 7) / 8;
-      if (cols * element_bytes % 32 != 0) {
+      int element_bits = src->dtype.bits();
+      if (cols * element_bits % 256 != 0) {
         TVM_FFI_THROW(ValueError)
             << "UB ND->NZ same-dtype scatter requires a 32-byte-aligned row, "
                "got cols="
@@ -429,10 +431,13 @@ private:
     int64_t rows_i = RequireStaticInt(rows, "ND->NZ rows");
     int64_t cols_i = RequireStaticInt(cols, "ND->NZ cols");
     if (copy.src->dtype.is_float8_e4m3fn() ||
-        copy.dst->dtype.is_float8_e4m3fn()) {
+        copy.dst->dtype.is_float8_e4m3fn() ||
+        copy.src->dtype.is_float4_e2m1fn() ||
+        copy.dst->dtype.is_float4_e2m1fn()) {
       ValidateScatterTemplate(copy.src, copy.dst, rows_i, cols_i, true);
       if (RequireStaticInt(copy.dst->shape[dst_ndim - 2], "L1 rows") % 16 != 0)
-        TVM_FFI_THROW(ValueError) << "E4M3 NZ L1 rows must be divisible by 16";
+        TVM_FFI_THROW(ValueError)
+            << "E4M3/FP4 NZ L1 rows must be divisible by 16";
     }
     if (cols_i == AscendC0(copy.dst->dtype.bits()) && same_dtype)
       return make_post_copy(src_ptr, rows);
@@ -461,7 +466,7 @@ private:
   }
 
   void ValidatePostCopyPointer(const PrimExpr &pointer, int64_t span_bytes,
-                               int64_t element_bytes, bool source) const {
+                               int64_t element_bits, bool source) const {
     const auto *access = pointer.as<CallNode>();
     if (!access || !access->op.same_as(tl::access_ptr()))
       return; // Raw pointer callers own the allocation/alignment contract.
@@ -470,7 +475,7 @@ private:
       return;
     const Buffer &buffer = load->buffer;
     if ((source ? !IsSharedBuffer(buffer) : !IsL1Buffer(buffer)) ||
-        buffer->dtype.bytes() != element_bytes)
+        buffer->dtype.bits() != element_bits)
       TVM_FFI_THROW(ValueError)
           << "NZ post-copy requires matching UB/L1 pointer element widths";
     Array<PrimExpr> indices = load->indices;
@@ -494,12 +499,12 @@ private:
     // Alignment uses the absolute address; bounds are relative to this view.
     PrimExpr address = offset + cast(DataType::Int(64), buffer->elem_offset);
     if (!analyzer_->CanProveEqual(
-            floormod(address * Integer(element_bytes), 32), 0))
+            floormod(address * Integer(element_bits), 256), 0))
       TVM_FFI_THROW(ValueError)
           << "NZ post-copy requires a 32-byte-aligned pointer: "
           << buffer->name;
     if (!analyzer_->CanProve(address >= 0 && offset >= 0 &&
-                             offset + Integer(span_bytes / element_bytes) <=
+                             offset + Integer(span_bytes * 8 / element_bits) <=
                                  capacity))
       TVM_FFI_THROW(ValueError)
           << "NZ post-copy physical span exceeds pointer buffer capacity: "
@@ -544,10 +549,10 @@ private:
         return Evaluate(Integer(0));
       ValidatePostCopyPointer(call->args[0],
                               geometry.SpanBytes(geometry.dst_pitch),
-                              geometry.dst_bytes, false);
+                              geometry.dst_bits, false);
       ValidatePostCopyPointer(call->args[1],
                               geometry.SpanBytes(geometry.src_pitch),
-                              geometry.src_bytes, true);
+                              geometry.src_bits, true);
       // Explicit pitches need not match a multidimensional view's layout.
       // Prove the destination independently; an opaque source must not erase
       // the disjoint AIV row slices of a valid NZ destination.

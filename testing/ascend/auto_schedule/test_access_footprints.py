@@ -716,15 +716,15 @@ def test_nd2nz_scatter_source_can_alias_a_later_ub_copy_destination():
     assert ("other", "src") in _insert_sync_alias_pairs(_infer_fractal_layouts(main))
 
 
-@pytest.mark.parametrize("dtype", ["float32", "float16", "float8_e4m3fn"])
+@pytest.mark.parametrize("dtype", ["float32", "float16", "float8_e4m3fn", "float4_e2m1fn"])
 @pytest.mark.parametrize("footprint", ["base", "short", "exact", "padded"])
 @pytest.mark.parametrize("src_pitch", [2, 64])
 def test_nd2nz_post_copy_keeps_the_last_required_element_live(dtype, footprint, src_pitch):
-    cols = {"float32": 16, "float16": 32, "float8_e4m3fn": 64}[dtype]
+    cols = {"float32": 16, "float16": 32, "float8_e4m3fn": 64, "float4_e2m1fn": 128}[dtype]
     required = (src_pitch + 1) * (cols // 2)
     capacity = (src_pitch + 2) * (cols // 2)
     extent = {"base": 1, "short": required - 1, "exact": required, "padded": capacity}[footprint]
-    dtype_name = {"float32": "float", "float16": "half", "float8_e4m3fn": "fp8_e4_t"}[dtype]
+    dtype_name = {"float32": "float", "float16": "half", "float8_e4m3fn": "fp8_e4_t", "float4_e2m1fn": "float4_e2m1x2_t"}[dtype]
 
     @T.prim_func
     def main(out: T.Tensor((1,), dtype)):
@@ -735,12 +735,12 @@ def test_nd2nz_post_copy_keeps_the_last_required_element_live(dtype, footprint, 
             with T.Stage(0):
                 with T.Task():
                     for i in T.serial(capacity):
-                        a[i] = T.cast(100, dtype)
-                b[required - 1] = T.cast(200, dtype)
+                        a[i] = T.cast(1, dtype)
+                b[required - 1] = T.cast(2, dtype)
                 out[0] = b[required - 1]
                 with T.Task():
                     for i in T.serial(required - 1):
-                        a[i] = T.cast(300, dtype)
+                        a[i] = T.cast(3, dtype)
                 T.call_intrin(
                     "void",
                     tvm.ir.Op.get("tl.ascend_nd2nz_post_copy"),
