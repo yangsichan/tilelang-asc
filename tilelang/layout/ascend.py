@@ -87,6 +87,11 @@ def make_ascend_l0c_layout(buffer: BufferLikeType):
 
     The physical shape is ``[.., N / 16, M / 16, 16, 16]`` and the forward map
     is ``(.., m, n) -> [.., n / 16, m / 16, m % 16, n % 16]``.
+
+    This layout can also annotate a UB buffer to preserve NZ in L0C-to-UB
+    ``T.copy`` and ``T.dual_copy``. Declare padding in the buffer shape;
+    copy regions retain the physical panel pitch of that allocation and
+    must cover whole 16-column panels. Buffer indices remain logical.
     """
     buf, _, _ = _get_buffer_info(buffer)
     return _ffi_api.make_ascend_l0c_layout(buf)
@@ -111,7 +116,8 @@ def make_strided_slice(phys_buf, layout, logical_region):
 
     The result is a plain strided Buffer sharing ``phys_buf``'s data pointer,
     with explicit shape (extents) and strides pointing at the sub-region's
-    base element. No layout knowledge is needed by the consumer.
+    base element, including ``phys_buf.elem_offset``. No layout knowledge is
+    needed by the consumer.
 
     Args:
         phys_buf: The physical (remapped) buffer, e.g. with NZ shape
