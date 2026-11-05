@@ -14,7 +14,8 @@ Inputs, reference computations and correctness checks run on the NPU.
 | [FP8 quantization](example_per_token_cast_to_fp8.py) | The same group-wise quantization in SIMT and explicit SIMD |
 
 For advanced GEMM implementations and tuning, see [deepgemm](deepgemm).
-Attention kernels are in [flash_attention](flash_attention/README.md).
+Attention kernels are in [flash_attention](flash_attention/README.md);
+sparse attention (GLM-5.3 DSA) is in [glm_dsa](glm_dsa/README.md).
 
 Run an example directly to check correctness and report device performance.
 GEMM and attention report latency and TFLOPS; vector addition, RMSNorm and FP8
