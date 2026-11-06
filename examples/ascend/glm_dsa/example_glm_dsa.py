@@ -29,13 +29,10 @@ query row.  M is padded to 16 rows, each holding a copy of the same query
 vector; the padding is pure shape compliance (Cube M granularity is 16) and does
 not change the result.
 
-Performance note: the one-query-wide M tile wastes 15/16 of every Cube tile, and
-both AIVs then run the softmax on 8 identical rows.  Filling M with several
-heads needs one sparse selection shared across heads together with a shared K
-base, which this input contract does not provide.  Two independent follow-ups
-remain: vectorise the mask lookup with ``S.vgather2`` instead of the scalar
-loop, and benchmark against ops-transformer ``sparse_flash_attention`` on
-identical inputs.
+Performance note: M contains 16 copies of one query, not 16 useful queries.
+The vector mask path widens an aligned raw row once per task and gathers flags
+per KV tile. Other lengths retain the scalar path. Further performance changes
+must preserve the mask contract and be measured against the same GBSA boundary.
 """
 
 import argparse
@@ -101,6 +98,45 @@ def _copy_row_pair(dst, src, row_stride):
     )
 
 
+@T.macro
+def _expand_mask_row(mask_row_ub, mask_words_ub, kv_len):
+    """Widen the raw uint8 mask row to uint32 using only vector loads/stores."""
+    with T.SimdVF():
+        S.mem_bar("VST_VLD")
+        full32 = S.pset(32, "PAT_ALL")
+        for chunk in T.serial(kv_len // 256):
+            raw = S.vld(mask_row_ub[chunk * 256], "NORM")
+            packed = T.reinterpret(raw, "uint32x64")
+            byte_mask = S.vdup(T.uint32(255), "uint32", full32)
+            byte0 = S.vand(packed, byte_mask, full32)
+            byte1 = S.vand(S.vshrs(packed, 8, full32), byte_mask, full32)
+            byte2 = S.vand(S.vshrs(packed, 16, full32), byte_mask, full32)
+            byte3 = S.vand(S.vshrs(packed, 24, full32), byte_mask, full32)
+            even_low, even_high = S.vintlv(byte0, byte2)
+            odd_low, odd_high = S.vintlv(byte1, byte3)
+            S.vst2(mask_words_ub[chunk * 256], even_low, odd_low)
+            S.vst2(mask_words_ub[chunk * 256 + 128], even_high, odd_high)
+
+
+
+@T.macro
+def _vector_mask_penalty(indices_ub, mask_words_ub, penalty_ub, kv_len):
+    """Produce this tile's 128 flags, matching the ascending paired K/V DMA."""
+    with T.SimdVF():
+        S.mem_bar("VST_VLD")
+        full = S.pset(32, "PAT_ALL")
+        even, odd = S.vld2(indices_ub[0], "DINTLV_B32")
+        first = T.reinterpret(S.vmin(even, odd, full), "uint32x64")
+        second = T.reinterpret(S.vmax(even, odd, full), "uint32x64")
+        keep_first = S.vgather2(T.access_ptr(mask_words_ub[0], "r", extent=kv_len), first, full)
+        keep_second = S.vgather2(T.access_ptr(mask_words_ub[0], "r", extent=kv_len), second, full)
+        zero = S.vdup(T.float32(0.0), ACCUM_DTYPE, full)
+        one = S.vdup(T.float32(1.0), ACCUM_DTYPE, full)
+        first_flag = S.vsel(zero, one, S.vcmps(keep_first, T.uint32(0), full, op="ne"))
+        second_flag = S.vsel(zero, one, S.vcmps(keep_second, T.uint32(0), full, op="ne"))
+        S.vst2(penalty_ub[0], first_flag, second_flag)
+
+
 def glm_dsa_fwd(
     batch_size,
     seq_len,
@@ -135,7 +171,9 @@ def glm_dsa_fwd(
     # kv_len reads the mask scalar from GM instead: same result, slower pass.
     MASK_STAGE_BYTES = 32 * 1024
     MASK_STAGED = (kv_len % 32 == 0) and (kv_len <= MASK_STAGE_BYTES)
-    # Read indices from GM: the former UB staging path failed NPU accuracy.
+    # Bound the widened row's UB footprint; other lengths keep the scalar path.
+    VECTOR_MASK = MASK_STAGED and kv_len % 256 == 0 and kv_len <= 8192
+    # K/V always read their indices from GM, independent of the mask path.
 
     NUM_BLOCKS = (
         pick_num_blocks(seq_len, batch_size, heads_per_task=HEADS_PER_TASK)
@@ -202,9 +240,8 @@ def glm_dsa_fwd(
 
         ``penalty_ub[i]`` becomes 0.0 for a participating slot and 1.0
         otherwise; ``softmax_pack`` turns that into a lane predicate.  The mask
-        is indexed by KV position, so the lookups stay scalar.  Replacing this
-        loop with a UB-resident row plus ``S.vgather2`` is the first
-        optimisation once correctness is pinned down.
+        is indexed by KV position. This fallback keeps scalar lookups; aligned
+        full-tile lengths within the UB budget use _vector_mask_penalty instead.
 
         Every AIV covers the whole ``BLOCK_TOP_K`` block: the dual copy splits
         ``qk_acc_l0c`` along M only, so each AIV's ``S_ub`` rows still span all
@@ -412,6 +449,8 @@ def glm_dsa_fwd(
             old_m_ub = T.alloc_shared((ROWS_PER_AIV,), ACCUM_DTYPE)
             penalty_ub = T.alloc_shared((BLOCK_TOP_K,), ACCUM_DTYPE)
             mask_row_ub = T.alloc_shared((kv_len if MASK_STAGED else 32,), "uint8")
+            mask_words_ub = T.alloc_shared((kv_len if VECTOR_MASK else 1,), "uint32")
+            mask_indices_ub = T.alloc_shared((BLOCK_TOP_K,), "int32")
 
             T.annotate_layout(
                 {
@@ -451,6 +490,9 @@ def glm_dsa_fwd(
                 }
             )
 
+            if VECTOR_MASK:
+                T.annotate_buffer_versions({mask_words_ub: 1, mask_indices_ub: 2})
+
             # Each core gets exactly its share, including the partial final round.
             for task in T.serial((NUM_TASKS + NUM_BLOCKS - 1 - core_id) // NUM_BLOCKS):
                 query_group = task * NUM_BLOCKS + core_id
@@ -463,6 +505,9 @@ def glm_dsa_fwd(
                 # index tiles.  Otherwise every lookup stays a GM scalar read.
                 if MASK_STAGED:
                     T.copy(Mask[batch_id, 0, query_id, 0:kv_len], mask_row_ub)
+
+                if VECTOR_MASK:
+                    _expand_mask_row(mask_row_ub, mask_words_ub, kv_len)
 
                 for head_offset in T.serial(HEADS_PER_TASK):
                     head = head_start + head_offset
@@ -523,16 +568,20 @@ def glm_dsa_fwd(
                             V_l1,
                         )
 
-                        mask_penalty(
-                            Mask,
-                            mask_row_ub,
-                            penalty_ub,
-                            block_valid,
-                            batch_id,
-                            query_id,
-                            block_base,
-                            Indices,
-                        )
+                        if VECTOR_MASK:
+                            T.copy(Indices[batch_id, query_id, block_base : block_base + BLOCK_TOP_K], mask_indices_ub)
+                            _vector_mask_penalty(mask_indices_ub, mask_words_ub, penalty_ub, kv_len)
+                        else:
+                            mask_penalty(
+                                Mask,
+                                mask_row_ub,
+                                penalty_ub,
+                                block_valid,
+                                batch_id,
+                                query_id,
+                                block_base,
+                                Indices,
+                            )
                         softmax_pack(S_ub, P_nz_ub, m_ub, l_ub, alpha_ub, old_m_ub, penalty_ub)
                         T.dual_copy(P_nz_ub[:ROWS_PER_AIV, :], P_l1)
                         # Keep PV operand loads and GEMM in one Cube task.

@@ -7,14 +7,54 @@ in Python, so the shapes stay small.
 
 import pytest
 import torch
+import tilelang
+import tilelang.ascend.language as T
 
 from example_glm_dsa import (
     FwdTiling,
     NUM_HEADS,
+    _expand_mask_row,
+    _vector_mask_penalty,
     compile_kernel,
     make_inputs,
     reference_attention,
 )
+
+
+def _build_mask_flag_probe(kv_len):
+    @T.prim_func
+    def flags(Mask: T.Buffer((kv_len,), "uint8"),
+              Indices: T.Buffer((128,), "int32"),
+              Out: T.Buffer((128,), "float32")):
+        with T.Kernel(1) as core_id:
+            row = T.alloc_shared((kv_len,), "uint8")
+            words = T.alloc_shared((kv_len,), "uint32")
+            selected = T.alloc_shared((128,), "int32")
+            penalty = T.alloc_shared((128,), "float32")
+            T.copy(Mask, row)
+            T.copy(Indices, selected)
+            _expand_mask_row(row, words, kv_len)
+            _vector_mask_penalty(selected, words, penalty, kv_len)
+            T.copy(penalty, Out)
+    return flags
+
+
+@pytest.mark.parametrize("kv_len", [256, 2048, 8192])
+def test_vector_mask_flags(kv_len):
+    """Exact0/1 flags, shuffled pairs and repeated calls with changed masks."""
+    import torch_npu  # noqa: F401 - register the NPU tensor backend
+
+    kernel = tilelang.compile(_build_mask_flag_probe(kv_len), target="ascend", out_idx=-1)
+    generator = torch.Generator().manual_seed(20261106)
+    indices = torch.randperm(kv_len, generator=generator)[:128].int()
+    mixed = torch.randint(0, 4, (kv_len,), generator=generator, dtype=torch.uint8)
+    for step, mask in enumerate((mixed, torch.ones_like(mixed), torch.zeros_like(mixed), mixed.roll(13))):
+        selected = (indices + 17 * step) % kv_len
+        ordered = selected.reshape(64, 2).sort(dim=1).values.reshape(128).long()
+        expected = (mask[ordered] == 0).float()
+        actual = kernel(mask.to("npu"), selected.to("npu"))
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 def _check(batch_size, seq_len, kv_len, num_blocks, mask_mode="mixed"):
