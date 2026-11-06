@@ -24,7 +24,7 @@ query.  A selected KV position whose byte is zero is dropped from the softmax.
 A query whose whole selection is dropped emits zeros instead of NaN.
 
 Kernel shape: unlike the shared-KV MLA example, K and V are per head here, so a
-task is one ``(batch, query, head)`` tuple and the Cube M dimension carries a single
+task is one ``(batch, query, head-group)`` tuple and the Cube M dimension carries a single
 query row.  M is padded to 16 rows, each holding a copy of the same query
 vector; the padding is pure shape compliance (Cube M granularity is 16) and does
 not change the result.
@@ -135,23 +135,21 @@ def glm_dsa_fwd(
     # kv_len reads the mask scalar from GM instead: same result, slower pass.
     MASK_STAGE_BYTES = 32 * 1024
     MASK_STAGED = (kv_len % 32 == 0) and (kv_len <= MASK_STAGE_BYTES)
-    # Staged indices need a 32B-aligned row origin as well: top_k * 4 % 32 == 0.
-    INDEX_STAGED = False
+    # Read indices from GM: the former UB staging path failed NPU accuracy.
 
-    NUM_BLOCKS = get_num_cube_cores(torch.npu.current_device()) if num_blocks is None else num_blocks
+    NUM_BLOCKS = (
+        pick_num_blocks(seq_len, batch_size, heads_per_task=HEADS_PER_TASK)
+        if num_blocks is None else num_blocks
+    )
     assert NUM_BLOCKS > 0, "num_blocks must be positive"
     NUM_TASKS = batch_size * seq_len * HEAD_GROUPS
-    assert NUM_TASKS % NUM_BLOCKS == 0, "query-head tasks must be a multiple of num_blocks"
-    TASKS_PER_CORE = NUM_TASKS // NUM_BLOCKS
-    assert TASKS_PER_CORE > 0, "num_blocks exceeds the number of query-head tasks"
+    assert NUM_BLOCKS <= NUM_TASKS, "num_blocks exceeds the number of query-head tasks"
     NUM_TOPK_BLOCKS = (top_k + BLOCK_TOP_K - 1) // BLOCK_TOP_K
 
     # -- shared T.macros --------------------------------------------------
 
-    def read_index(indices_ub, Indices, batch_id, query_id, block_base, lane):
-        """Index ``lane`` of the current tile, staged in UB or read scalar."""
-        if INDEX_STAGED:
-            return T.int32(indices_ub[lane])
+    def read_index(Indices, batch_id, query_id, block_base, lane):
+        """Read a sparse index directly from GM."""
         return T.int32(Indices[batch_id, query_id, block_base + lane])
 
     def read_keep(Mask, mask_row_ub, batch_id, query_id, position):
@@ -161,7 +159,7 @@ def glm_dsa_fwd(
         return Mask[batch_id, 0, query_id, position] != T.uint8(0)
 
     @T.macro
-    def gather_rows(src, batch_id, query_id, head, block_base, valid_count, sid, indices_src, indices_ub, raw_ub, nz_ub, l1):
+    def gather_rows(src, batch_id, query_id, head, block_base, valid_count, sid, indices_src, raw_ub, nz_ub, l1):
         """Each AIV gathers one half of the sparse tile.
 
         Lanes at or past ``valid_count`` re-gather the last valid position rather
@@ -177,8 +175,8 @@ def glm_dsa_fwd(
             for pair in T.Serial(CHUNK_ROWS // 2):
                 lane0 = T.min(row_start + 2 * pair, valid_count - 1)
                 lane1 = T.min(row_start + 2 * pair + 1, valid_count - 1)
-                index0 = read_index(indices_ub, indices_src, batch_id, query_id, block_base, lane0)
-                index1 = read_index(indices_ub, indices_src, batch_id, query_id, block_base, lane1)
+                index0 = read_index(indices_src, batch_id, query_id, block_base, lane0)
+                index1 = read_index(indices_src, batch_id, query_id, block_base, lane1)
                 T.assume(index0 >= 0)
                 T.assume(index0 < kv_len)
                 T.assume(index1 >= 0)
@@ -199,7 +197,7 @@ def glm_dsa_fwd(
             T.copy(nz_ub[:CHUNK_ROWS, :], l1[row_start : row_start + CHUNK_ROWS, :])
 
     @T.macro
-    def mask_penalty(Mask, mask_row_ub, penalty_ub, valid_count, batch_id, query_id, block_base, indices_src, indices_ub):
+    def mask_penalty(Mask, mask_row_ub, penalty_ub, valid_count, batch_id, query_id, block_base, indices_src):
         """Fold attention_mask and the partial-tile tail into one keep flag.
 
         ``penalty_ub[i]`` becomes 0.0 for a participating slot and 1.0
@@ -229,8 +227,8 @@ def glm_dsa_fwd(
             valid_rows = T.max(T.min(valid_count - row_start, CHUNK_ROWS), 0)
             for pair in T.Serial(valid_rows // 2):
                 lane0 = row_start + 2 * pair
-                index0 = read_index(indices_ub, indices_src, batch_id, query_id, block_base, lane0)
-                index1 = read_index(indices_ub, indices_src, batch_id, query_id, block_base, lane0 + 1)
+                index0 = read_index(indices_src, batch_id, query_id, block_base, lane0)
+                index1 = read_index(indices_src, batch_id, query_id, block_base, lane0 + 1)
                 index0 = T.max(T.min(index0, kv_len - 1), 0)
                 index1 = T.max(T.min(index1, kv_len - 1), 0)
                 if read_keep(Mask, mask_row_ub, batch_id, query_id, T.min(index0, index1)):
@@ -239,7 +237,7 @@ def glm_dsa_fwd(
                     penalty_ub[lane0 + 1] = T.float32(0.0)
             if valid_rows % 2 != 0:
                 tail_lane = row_start + valid_rows - 1
-                tail_index = read_index(indices_ub, indices_src, batch_id, query_id, block_base, tail_lane)
+                tail_index = read_index(indices_src, batch_id, query_id, block_base, tail_lane)
                 tail_index = T.max(T.min(tail_index, kv_len - 1), 0)
                 if read_keep(Mask, mask_row_ub, batch_id, query_id, tail_index):
                     penalty_ub[tail_lane] = T.float32(0.0)
@@ -413,7 +411,6 @@ def glm_dsa_fwd(
             alpha_ub = T.alloc_shared((ROWS_PER_AIV,), ACCUM_DTYPE)
             old_m_ub = T.alloc_shared((ROWS_PER_AIV,), ACCUM_DTYPE)
             penalty_ub = T.alloc_shared((BLOCK_TOP_K,), ACCUM_DTYPE)
-            indices_ub = T.alloc_shared((BLOCK_TOP_K,), "int32")
             mask_row_ub = T.alloc_shared((kv_len if MASK_STAGED else 32,), "uint8")
 
             T.annotate_layout(
@@ -445,7 +442,6 @@ def glm_dsa_fwd(
                     V_nz_ub: 2,
                     P_nz_ub: 2,
                     O_tmp_ub: 2,
-                    indices_ub: 2,
                     alpha_ub: 2,
                     # Loop-carried across tiles: must stay single-versioned.
                     O_ub: 1,
@@ -455,7 +451,8 @@ def glm_dsa_fwd(
                 }
             )
 
-            for task in T.serial(TASKS_PER_CORE):
+            # Each core gets exactly its share, including the partial final round.
+            for task in T.serial((NUM_TASKS + NUM_BLOCKS - 1 - core_id) // NUM_BLOCKS):
                 query_group = task * NUM_BLOCKS + core_id
                 query = query_group // HEAD_GROUPS
                 head_start = (query_group % HEAD_GROUPS) * HEADS_PER_TASK
@@ -489,11 +486,6 @@ def glm_dsa_fwd(
                     ):
                         block_base = block * BLOCK_TOP_K
                         block_valid = T.min(top_k - block_base, BLOCK_TOP_K)
-                        if INDEX_STAGED:
-                            T.copy(
-                                Indices[batch_id, query_id, block_base : block_base + block_valid],
-                                indices_ub[:block_valid],
-                            )
 
                         # QK -> masked sparse softmax -> PV.
                         gather_rows(
@@ -505,7 +497,6 @@ def glm_dsa_fwd(
                             block_valid,
                             sid,
                             Indices,
-                            indices_ub,
                             K_ub,
                             K_nz_ub,
                             K_l1,
@@ -527,7 +518,6 @@ def glm_dsa_fwd(
                             block_valid,
                             sid,
                             Indices,
-                            indices_ub,
                             V_ub,
                             V_nz_ub,
                             V_l1,
@@ -542,7 +532,6 @@ def glm_dsa_fwd(
                             query_id,
                             block_base,
                             Indices,
-                            indices_ub,
                         )
                         softmax_pack(S_ub, P_nz_ub, m_ub, l_ub, alpha_ub, old_m_ub, penalty_ub)
                         T.dual_copy(P_nz_ub[:ROWS_PER_AIV, :], P_l1)
@@ -616,18 +605,17 @@ def compile_kernel(batch_size, seq_len, kv_len, *, num_blocks=None, tiling=None)
     )
 
 
-def pick_num_blocks(seq_len, batch_size=1, cores=None, *, heads_per_task=4):
+def pick_num_blocks(seq_len, batch_size=1, cores=None, *, heads_per_task=None):
+    heads_per_task = FwdTiling().heads_per_task if heads_per_task is None else heads_per_task
+    assert heads_per_task in (1, 2, 4, 8, 16, 32, 64)
+    assert batch_size > 0 and seq_len > 0
     cores = get_num_cube_cores(torch.npu.current_device()) if cores is None else cores
+    assert cores > 0, "cores must be positive"
     tasks = batch_size * seq_len * (NUM_HEADS // heads_per_task)
-    blocks = min(cores, tasks)
-    while blocks > 1 and tasks % blocks != 0:
-        blocks -= 1
-    return blocks
+    return min(cores, tasks)
 
 
 def run(batch_size=1, seq_len=448, *, kv_len=4096, num_blocks=None, tiling=None):
-    if num_blocks is None:
-        num_blocks = pick_num_blocks(seq_len, batch_size)
     kernel = compile_kernel(batch_size, seq_len, kv_len, num_blocks=num_blocks, tiling=tiling)
     q, k, v, indices, mask = make_inputs(batch_size, seq_len, kv_len)
     expected = reference_attention(q, k, v, indices, mask)

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from example_glm_dsa import (
+    FwdTiling,
     NUM_HEADS,
     compile_kernel,
     make_inputs,
@@ -66,9 +67,8 @@ def test_partial_tile_tail():
 def test_unaligned_kv_len(kv_len, seq_len):
     """T need not be 32-aligned or <= 32768.
 
-    257 is neither, so both the mask and the indices fall back to scalar GM
-    reads; 2049 keeps a staged index tile (Ksel = 2048) but not a staged mask
-    row, and spans several index tiles.
+    Both lengths read masks from GM. Sparse indices use GM reads for every
+    shape; T=2049 also exercises the 2048-position TopK limit.
     """
     _check(1, seq_len, kv_len, seq_len)
 
@@ -100,3 +100,21 @@ def test_both_halves_of_a_tile_contribute():
 
     expected = torch.full_like(actual.float(), 0.5)
     torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("seq_len,kv_len,heads_per_task", [(16, 2048, 32), (17, 2049, 2), (1, 257, 64)])
+def test_custom_tiling_auto_grid(seq_len, kv_len, heads_per_task):
+    """A custom head group must select its grid without an explicit num_blocks."""
+    kernel = compile_kernel(1, seq_len, kv_len, tiling=FwdTiling(heads_per_task=heads_per_task))
+    q, k, v, indices, mask = make_inputs(1, seq_len, kv_len)
+    expected = reference_attention(q, k, v, indices, mask)
+    actual = kernel(q, k, v, indices, mask.view(torch.uint8))
+    torch.npu.synchronize()
+    assert actual.dtype == torch.bfloat16
+    assert actual.shape == expected.shape and actual.is_contiguous()
+    torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-2)
+
+
+def test_nondivisible_task_grid():
+    """B1/sq3 has 48 default head-group tasks: 28 cores leave a partial round."""
+    _check(1, 3, 257, 28)
