@@ -30,7 +30,6 @@ class FwdTiling:
     block_kv: int = 128
     num_stages: int = 3
 
-
 def flash_attention_fwd(
     q_len,
     kv_len,
@@ -43,6 +42,13 @@ def flash_attention_fwd(
     manual_schedule=False,
     return_lse=False,
 ):
+    """Keep each Q tile in its own L0A buffer for the complete KV loop.
+
+    Q is loaded from L1 to qk_a_l0 once per query tile. The KV loop only
+    reads that buffer; PV continues to use the separate pv_a_l0 allocation.
+    Both GEMMs and their L0C-to-UB drains use paired UnitFlag control 3.
+    Shapes, tile sizes, arithmetic and launch geometry match the original.
+    """
     tiling = tiling or FwdTiling()
 
     # Expand config into compile-time local scalars so the hygienic T.macro
@@ -56,6 +62,7 @@ def flash_attention_fwd(
     dtype = "bfloat16"
     accum_dtype = "float32"
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+    SCALE_AFTER_MAX = math.isfinite(scale) and scale > 0
 
     # Implementation constraints of the SIMD softmax-packing path. These are
     # real limits of the current kernel, not tunables — validate explicitly
@@ -79,15 +86,16 @@ def flash_attention_fwd(
         f"out_dtype must be {accum_dtype} (no cast) or a 16-bit type (bfloat16/float16); got {out_dtype!r}."
     )
 
-    # -- shared T.macros (capture the compile-time locals above) -------------
-
     @T.macro
-    def qk(kv, K, Q_shared, K_shared, qk_a_l0, qk_b_l0, qk_acc_l0c, S_ub):
+    def qk(kv, K, K_shared, qk_a_l0, qk_b_l0, qk_acc_l0c, S_ub):
         T.copy(K[kv * BC : (kv + 1) * BC, 0:D], K_shared[0:BC, 0:D])
-        T.copy(Q_shared[0:BR, 0:D], qk_a_l0)
         T.copy(K_shared[0:BC, 0:D], qk_b_l0)
-        T.gemm(qk_a_l0, qk_b_l0, qk_acc_l0c, transpose_B=True, clear_accum=True)
-        T.dual_copy(qk_acc_l0c, S_ub[0:ROWS, 0:BC])
+        T.gemm(
+            qk_a_l0, qk_b_l0, qk_acc_l0c,
+            transpose_B=True, clear_accum=True,
+            unit_flag_ctrl=3,
+        )
+        T.dual_copy(qk_acc_l0c, S_ub[0:ROWS, 0:BC], unit_flag_ctrl=3)
 
     @T.macro
     def softmax(S_ub, P_nz_ub, m_ub, l_ub, alpha_ub, old_m_ub, row_sum_ub):
@@ -100,17 +108,27 @@ def flash_attention_fwd(
                 "bfloat16",
             )
 
-            S.vsts(old_m_ub[0], S.vld(m_ub[0], "NORM"), softmax_full, "NORM_B32")
+            old_m_reg = S.vld(m_ub[0], "NORM")
 
             for r in range(0, ROWS, 2):
-                s00 = S.vmuls(S.vld(S_ub[r, 0], "NORM"), T.float32(scale), softmax_full)
-                s01 = S.vmuls(S.vld(S_ub[r, VL], "NORM"), T.float32(scale), softmax_full)
-                s10 = S.vmuls(S.vld(S_ub[r + 1, 0], "NORM"), T.float32(scale), softmax_full)
-                s11 = S.vmuls(S.vld(S_ub[r + 1, VL], "NORM"), T.float32(scale), softmax_full)
-                S.vsts(S_ub[r, 0], s00, softmax_full, "NORM_B32")
-                S.vsts(S_ub[r, VL], s01, softmax_full, "NORM_B32")
-                S.vsts(S_ub[r + 1, 0], s10, softmax_full, "NORM_B32")
-                S.vsts(S_ub[r + 1, VL], s11, softmax_full, "NORM_B32")
+                # A positive scale preserves ordering; scale the row maxima once.
+                # This is a compile-time choice, retaining the old path otherwise.
+                s00 = (
+                    S.vld(S_ub[r, 0], "NORM") if SCALE_AFTER_MAX
+                    else S.vmuls(S.vld(S_ub[r, 0], "NORM"), T.float32(scale), softmax_full)
+                )
+                s01 = (
+                    S.vld(S_ub[r, VL], "NORM") if SCALE_AFTER_MAX
+                    else S.vmuls(S.vld(S_ub[r, VL], "NORM"), T.float32(scale), softmax_full)
+                )
+                s10 = (
+                    S.vld(S_ub[r + 1, 0], "NORM") if SCALE_AFTER_MAX
+                    else S.vmuls(S.vld(S_ub[r + 1, 0], "NORM"), T.float32(scale), softmax_full)
+                )
+                s11 = (
+                    S.vld(S_ub[r + 1, VL], "NORM") if SCALE_AFTER_MAX
+                    else S.vmuls(S.vld(S_ub[r + 1, VL], "NORM"), T.float32(scale), softmax_full)
+                )
 
                 max0 = S.vcmax(S.vmax(s00, s01, softmax_full), softmax_full)
                 max1 = S.vcmax(S.vmax(s10, s11, softmax_full), softmax_full)
@@ -118,7 +136,11 @@ def flash_attention_fwd(
                 S.vsts(m_ub[r + 1], max1, softmax_one, "ONEPT_B32")
 
             S.mem_bar("VST_VLD")
-            merged_max = S.vmax(S.vld(m_ub[0], "NORM"), S.vld(old_m_ub[0], "NORM"), softmax_full)
+            block_max_scaled = (
+                S.vmuls(S.vld(m_ub[0], "NORM"), T.float32(scale), softmax_full)
+                if SCALE_AFTER_MAX else S.vld(m_ub[0], "NORM")
+            )
+            merged_max = S.vmax(block_max_scaled, old_m_reg, softmax_full)
             S.vsts(m_ub[0], merged_max, softmax_full, "NORM_B32")
             S.mem_bar("VST_VLD")
 
@@ -127,10 +149,11 @@ def flash_attention_fwd(
                 max1 = S.vld(m_ub[r + 1], "BRC_B32")
                 p00, p01 = S.vld2(S_ub[r, 0], "DINTLV_B32")
                 p10, p11 = S.vld2(S_ub[r + 1, 0], "DINTLV_B32")
-                e00 = S.vexpdif(p00, max0, softmax_full)
-                e10 = S.vexpdif(p10, max1, softmax_full)
-                e01 = S.vexpdif(p01, max0, softmax_full)
-                e11 = S.vexpdif(p11, max1, softmax_full)
+                # Recompute scaling instead of writing scaled scores back to UB.
+                e00 = S.vexpdif(S.vmuls(p00, T.float32(scale), softmax_full), max0, softmax_full)
+                e10 = S.vexpdif(S.vmuls(p10, T.float32(scale), softmax_full), max1, softmax_full)
+                e01 = S.vexpdif(S.vmuls(p01, T.float32(scale), softmax_full), max0, softmax_full)
+                e11 = S.vexpdif(S.vmuls(p11, T.float32(scale), softmax_full), max1, softmax_full)
                 row_sum0 = S.vcadd(S.vadd(e00, e01, softmax_full), softmax_full)
                 row_sum1 = S.vcadd(S.vadd(e10, e11, softmax_full), softmax_full)
                 S.vsts(row_sum_ub[r], row_sum0, softmax_one, "ONEPT_B32")
@@ -166,10 +189,12 @@ def flash_attention_fwd(
                 )
 
             S.mem_bar("VST_VLD")
-            alpha_reg = S.vexpdif(S.vld(old_m_ub[0], "NORM"), S.vld(m_ub[0], "NORM"), softmax_full)
+            alpha_reg = S.vexpdif(old_m_reg, merged_max, softmax_full)
             S.vsts(alpha_ub[0], alpha_reg, softmax_full, "NORM_B32")
-            l_scaled = S.vmul(S.vld(l_ub[0], "NORM"), alpha_reg, softmax_full)
-            l_updated = S.vadd(l_scaled, S.vld(row_sum_ub[0], "NORM"), softmax_full)
+            # Keep the online denominator update in one FP32 fused multiply-add.
+            l_updated = S.alloc_var(accum_dtype)
+            l_updated = S.vld(l_ub[0], "NORM")
+            S.vmadd(l_updated, alpha_reg, S.vld(row_sum_ub[0], "NORM"), softmax_full)
             S.vsts(l_ub[0], l_updated, softmax_full, "NORM_B32")
 
     @T.macro
@@ -181,8 +206,12 @@ def flash_attention_fwd(
         T.copy(V[kv * BC : (kv + 1) * BC, 0:D], V_shared[0:D, 0:BC], transpose=True)
         T.copy(P_shared[0:BR, 0:BC], pv_a_l0)
         T.copy(V_shared[0:D, 0:BC], pv_b_l0)
-        T.gemm(pv_a_l0, pv_b_l0, pv_acc_l0c, transpose_B=True, clear_accum=True)
-        T.dual_copy(pv_acc_l0c, O_tmp_ub[0:ROWS, 0:D])
+        T.gemm(
+            pv_a_l0, pv_b_l0, pv_acc_l0c,
+            transpose_B=True, clear_accum=True,
+            unit_flag_ctrl=3,
+        )
+        T.dual_copy(pv_acc_l0c, O_tmp_ub[0:ROWS, 0:D], unit_flag_ctrl=3)
 
     @T.macro
     def accumulate_output(O_tmp_ub, O_ub, alpha_ub):
@@ -191,9 +220,10 @@ def flash_attention_fwd(
             for i in range(ROWS):
                 alpha = S.vld(alpha_ub[i], "BRC_B32")
                 for c in range(0, D, VL):
-                    prev = S.vld(O_ub[i, c], "NORM")
+                    updated = S.alloc_var(accum_dtype)
+                    updated = S.vld(O_ub[i, c], "NORM")
                     cur = S.vld(O_tmp_ub[i, c], "NORM")
-                    updated = S.vadd(S.vmul(alpha, prev, rescale_mask), cur, rescale_mask)
+                    S.vmadd(updated, alpha, cur, rescale_mask)
                     S.vsts(O_ub[i, c], updated, rescale_mask, "NORM_B32")
 
     @T.macro
@@ -201,7 +231,6 @@ def flash_attention_fwd(
         kv,
         K,
         V,
-        Q_shared,
         K_shared,
         V_shared,
         P_shared,
@@ -221,18 +250,18 @@ def flash_attention_fwd(
         old_m_ub,
         row_sum_ub,
     ):
-        qk(kv, K, Q_shared, K_shared, qk_a_l0, qk_b_l0, qk_acc_l0c, S_ub)
+        qk(kv, K, K_shared, qk_a_l0, qk_b_l0, qk_acc_l0c, S_ub)
         softmax(S_ub, P_nz_ub, m_ub, l_ub, alpha_ub, old_m_ub, row_sum_ub)
         pack_p(P_nz_ub, P_shared)
         pv(kv, V, P_shared, V_shared, pv_a_l0, pv_b_l0, pv_acc_l0c, O_tmp_ub)
         accumulate_output(O_tmp_ub, O_ub, alpha_ub)
+
 
     @T.macro
     def kv_manual(
         kv,
         K,
         V,
-        Q_shared,
         K_shared,
         V_shared,
         P_shared,
@@ -254,15 +283,18 @@ def flash_attention_fwd(
     ):
         # Fixed-stage solution under manual per-pipe source ordering. The
         # stage vector in source task order is:
-        # [0,1,1,1,3,5,6,3,6,6,6,7,7].
+        # [0,1,1,3,5,6,3,6,6,6,7,7].
         with T.Stage(0):
             T.copy(K[kv * BC : (kv + 1) * BC, 0:D], K_shared[0:BC, 0:D])
         with T.Stage(1):
-            T.copy(Q_shared[0:BR, 0:D], qk_a_l0)
             T.copy(K_shared[0:BC, 0:D], qk_b_l0)
-            T.gemm(qk_a_l0, qk_b_l0, qk_acc_l0c, transpose_B=True, clear_accum=True)
+            T.gemm(
+                qk_a_l0, qk_b_l0, qk_acc_l0c,
+                transpose_B=True, clear_accum=True,
+                unit_flag_ctrl=3,
+            )
         with T.Stage(3):
-            T.dual_copy(qk_acc_l0c, S_ub[0:ROWS, 0:BC])
+            T.dual_copy(qk_acc_l0c, S_ub[0:ROWS, 0:BC], unit_flag_ctrl=3)
         with T.Stage(5):
             softmax(S_ub, P_nz_ub, m_ub, l_ub, alpha_ub, old_m_ub, row_sum_ub)
         with T.Stage(6):
@@ -272,9 +304,13 @@ def flash_attention_fwd(
         with T.Stage(6):
             T.copy(P_shared[0:BR, 0:BC], pv_a_l0)
             T.copy(V_shared[0:D, 0:BC], pv_b_l0)
-            T.gemm(pv_a_l0, pv_b_l0, pv_acc_l0c, transpose_B=True, clear_accum=True)
+            T.gemm(
+                pv_a_l0, pv_b_l0, pv_acc_l0c,
+                transpose_B=True, clear_accum=True,
+                unit_flag_ctrl=3,
+            )
         with T.Stage(7):
-            T.dual_copy(pv_acc_l0c, O_tmp_ub[0:ROWS, 0:D])
+            T.dual_copy(pv_acc_l0c, O_tmp_ub[0:ROWS, 0:D], unit_flag_ctrl=3)
             accumulate_output(O_tmp_ub, O_ub, alpha_ub)
 
     @T.macro
@@ -367,6 +403,8 @@ def flash_attention_fwd(
                 row_sum_ub = T.alloc_shared((ROWS,), accum_dtype)
                 T.annotate_buffer_versions(
                     {
+                        # One Q slot stays live across all KV iterations.
+                        qk_a_l0: 1,
                         K_shared: 3,
                         V_shared: 3,
                         qk_acc_l0c: 2,
@@ -381,6 +419,8 @@ def flash_attention_fwd(
                 for local_mt in T.serial(M_TILES_PER_BLOCK):
                     mt = bx * M_TILES_PER_BLOCK + local_mt
                     T.copy(Q[mt * BR : (mt + 1) * BR, 0:D], Q_shared[0:BR, 0:D])
+                    # Load Q into L0A once; qk() does not overwrite it in the KV loop.
+                    T.copy(Q_shared[0:BR, 0:D], qk_a_l0)
 
                     init_m_l(m_ub, l_ub)
                     clear_O_ub(O_ub)
@@ -394,7 +434,6 @@ def flash_attention_fwd(
                             kv,
                             K,
                             V,
-                            Q_shared,
                             K_shared,
                             V_shared,
                             P_shared,
@@ -458,6 +497,8 @@ def flash_attention_fwd(
             row_sum_ub = T.alloc_shared((ROWS,), accum_dtype)
             T.annotate_buffer_versions(
                 {
+                    # One Q slot stays live across all KV iterations.
+                    qk_a_l0: 1,
                     K_shared: 3,
                     V_shared: 3,
                     qk_acc_l0c: 2,
@@ -472,6 +513,8 @@ def flash_attention_fwd(
             for local_mt in T.serial(M_TILES_PER_BLOCK):
                 mt = bx * M_TILES_PER_BLOCK + local_mt
                 T.copy(Q[mt * BR : (mt + 1) * BR, 0:D], Q_shared[0:BR, 0:D])
+                # Load Q into L0A once; qk() does not overwrite it in the KV loop.
+                T.copy(Q_shared[0:BR, 0:D], qk_a_l0)
 
                 init_m_l(m_ub, l_ub)
                 clear_O_ub(O_ub)
@@ -485,7 +528,6 @@ def flash_attention_fwd(
                         kv,
                         K,
                         V,
-                        Q_shared,
                         K_shared,
                         V_shared,
                         P_shared,
