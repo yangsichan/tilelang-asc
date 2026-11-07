@@ -118,7 +118,6 @@ def _expand_mask_row(mask_row_ub, mask_words_ub, kv_len):
             S.vst2(mask_words_ub[chunk * 256 + 128], even_high, odd_high)
 
 
-
 @T.macro
 def _vector_mask_penalty(indices_ub, mask_words_ub, penalty_ub, kv_len):
     """Produce this tile's 128 flags, matching the ascending paired K/V DMA."""
@@ -172,13 +171,10 @@ def glm_dsa_fwd(
     MASK_STAGE_BYTES = 32 * 1024
     MASK_STAGED = (kv_len % 32 == 0) and (kv_len <= MASK_STAGE_BYTES)
     # Bound the widened row's UB footprint; other lengths keep the scalar path.
-    VECTOR_MASK = MASK_STAGED and kv_len % 256 == 0 and kv_len <= 8192
+    VECTOR_MASK = MASK_STAGED and kv_len % 256 == 0 and kv_len <= 8192 and top_k % BLOCK_TOP_K == 0
     # K/V always read their indices from GM, independent of the mask path.
 
-    NUM_BLOCKS = (
-        pick_num_blocks(seq_len, batch_size, heads_per_task=HEADS_PER_TASK)
-        if num_blocks is None else num_blocks
-    )
+    NUM_BLOCKS = pick_num_blocks(seq_len, batch_size, heads_per_task=HEADS_PER_TASK) if num_blocks is None else num_blocks
     assert NUM_BLOCKS > 0, "num_blocks must be positive"
     NUM_TASKS = batch_size * seq_len * HEAD_GROUPS
     assert NUM_BLOCKS <= NUM_TASKS, "num_blocks exceeds the number of query-head tasks"
@@ -625,7 +621,6 @@ def make_inputs(batch_size: int, seq_len: int, kv_len: int):
 def reference_attention(q, k, v, indices, mask):
     """Per-query reference in float32; the gathered tiles are too large to hold at once."""
     batch_size, heads, seq_len, dim = q.shape
-    top_k = indices.shape[-1]
     mask_u8 = mask.view(torch.uint8) if mask.dtype == torch.bool else mask
     out = torch.empty((batch_size, seq_len, heads, dim), dtype=torch.float32, device=q.device)
     for batch in range(batch_size):

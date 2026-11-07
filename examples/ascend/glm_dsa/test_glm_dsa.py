@@ -23,10 +23,8 @@ from example_glm_dsa import (
 
 def _build_mask_flag_probe(kv_len):
     @T.prim_func
-    def flags(Mask: T.Buffer((kv_len,), "uint8"),
-              Indices: T.Buffer((128,), "int32"),
-              Out: T.Buffer((128,), "float32")):
-        with T.Kernel(1) as core_id:
+    def flags(Mask: T.Buffer((kv_len,), "uint8"), Indices: T.Buffer((128,), "int32"), Out: T.Buffer((128,), "float32")):
+        with T.Kernel(1) as _:
             row = T.alloc_shared((kv_len,), "uint8")
             words = T.alloc_shared((kv_len,), "uint32")
             selected = T.alloc_shared((128,), "int32")
@@ -36,12 +34,13 @@ def _build_mask_flag_probe(kv_len):
             _expand_mask_row(row, words, kv_len)
             _vector_mask_penalty(selected, words, penalty, kv_len)
             T.copy(penalty, Out)
+
     return flags
 
 
 @pytest.mark.parametrize("kv_len", [256, 2048, 8192])
 def test_vector_mask_flags(kv_len):
-    """Exact0/1 flags, shuffled pairs and repeated calls with changed masks."""
+    """Exact 0/1 flags, shuffled pairs and repeated calls with changed masks."""
     import torch_npu  # noqa: F401 - register the NPU tensor backend
 
     kernel = tilelang.compile(_build_mask_flag_probe(kv_len), target="ascend", out_idx=-1)
@@ -127,12 +126,7 @@ def test_both_halves_of_a_tile_contribute():
     k = torch.zeros(batch_size, NUM_HEADS, kv_len, 256, dtype=torch.bfloat16, device="npu")
     v = torch.zeros(batch_size, NUM_HEADS, kv_len, 256, dtype=torch.bfloat16, device="npu")
     v[:, :, 64:, :] = 1.0
-    indices = (
-        torch.arange(kv_len, dtype=torch.int32, device="npu")
-        .view(1, 1, kv_len)
-        .expand(batch_size, seq_len, kv_len)
-        .contiguous()
-    )
+    indices = torch.arange(kv_len, dtype=torch.int32, device="npu").view(1, 1, kv_len).expand(batch_size, seq_len, kv_len).contiguous()
     attn_mask = torch.ones(batch_size, 1, seq_len, kv_len, dtype=torch.uint8, device="npu")
 
     actual = kernel(q, k, v, indices, attn_mask)
