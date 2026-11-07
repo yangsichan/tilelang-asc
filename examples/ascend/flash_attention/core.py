@@ -30,6 +30,7 @@ class FwdTiling:
     block_kv: int = 128
     num_stages: int = 3
 
+
 def flash_attention_fwd(
     q_len,
     kv_len,
@@ -91,8 +92,11 @@ def flash_attention_fwd(
         T.copy(K[kv * BC : (kv + 1) * BC, 0:D], K_shared[0:BC, 0:D])
         T.copy(K_shared[0:BC, 0:D], qk_b_l0)
         T.gemm(
-            qk_a_l0, qk_b_l0, qk_acc_l0c,
-            transpose_B=True, clear_accum=True,
+            qk_a_l0,
+            qk_b_l0,
+            qk_acc_l0c,
+            transpose_B=True,
+            clear_accum=True,
             unit_flag_ctrl=3,
         )
         T.dual_copy(qk_acc_l0c, S_ub[0:ROWS, 0:BC], unit_flag_ctrl=3)
@@ -113,20 +117,16 @@ def flash_attention_fwd(
             for r in range(0, ROWS, 2):
                 # A positive scale preserves ordering; scale the row maxima once.
                 # This is a compile-time choice, retaining the old path otherwise.
-                s00 = (
-                    S.vld(S_ub[r, 0], "NORM") if SCALE_AFTER_MAX
-                    else S.vmuls(S.vld(S_ub[r, 0], "NORM"), T.float32(scale), softmax_full)
-                )
-                s01 = (
-                    S.vld(S_ub[r, VL], "NORM") if SCALE_AFTER_MAX
-                    else S.vmuls(S.vld(S_ub[r, VL], "NORM"), T.float32(scale), softmax_full)
-                )
+                s00 = S.vld(S_ub[r, 0], "NORM") if SCALE_AFTER_MAX else S.vmuls(S.vld(S_ub[r, 0], "NORM"), T.float32(scale), softmax_full)
+                s01 = S.vld(S_ub[r, VL], "NORM") if SCALE_AFTER_MAX else S.vmuls(S.vld(S_ub[r, VL], "NORM"), T.float32(scale), softmax_full)
                 s10 = (
-                    S.vld(S_ub[r + 1, 0], "NORM") if SCALE_AFTER_MAX
+                    S.vld(S_ub[r + 1, 0], "NORM")
+                    if SCALE_AFTER_MAX
                     else S.vmuls(S.vld(S_ub[r + 1, 0], "NORM"), T.float32(scale), softmax_full)
                 )
                 s11 = (
-                    S.vld(S_ub[r + 1, VL], "NORM") if SCALE_AFTER_MAX
+                    S.vld(S_ub[r + 1, VL], "NORM")
+                    if SCALE_AFTER_MAX
                     else S.vmuls(S.vld(S_ub[r + 1, VL], "NORM"), T.float32(scale), softmax_full)
                 )
 
@@ -137,8 +137,7 @@ def flash_attention_fwd(
 
             S.mem_bar("VST_VLD")
             block_max_scaled = (
-                S.vmuls(S.vld(m_ub[0], "NORM"), T.float32(scale), softmax_full)
-                if SCALE_AFTER_MAX else S.vld(m_ub[0], "NORM")
+                S.vmuls(S.vld(m_ub[0], "NORM"), T.float32(scale), softmax_full) if SCALE_AFTER_MAX else S.vld(m_ub[0], "NORM")
             )
             merged_max = S.vmax(block_max_scaled, old_m_reg, softmax_full)
             S.vsts(m_ub[0], merged_max, softmax_full, "NORM_B32")
@@ -207,8 +206,11 @@ def flash_attention_fwd(
         T.copy(P_shared[0:BR, 0:BC], pv_a_l0)
         T.copy(V_shared[0:D, 0:BC], pv_b_l0)
         T.gemm(
-            pv_a_l0, pv_b_l0, pv_acc_l0c,
-            transpose_B=True, clear_accum=True,
+            pv_a_l0,
+            pv_b_l0,
+            pv_acc_l0c,
+            transpose_B=True,
+            clear_accum=True,
             unit_flag_ctrl=3,
         )
         T.dual_copy(pv_acc_l0c, O_tmp_ub[0:ROWS, 0:D], unit_flag_ctrl=3)
@@ -256,7 +258,6 @@ def flash_attention_fwd(
         pv(kv, V, P_shared, V_shared, pv_a_l0, pv_b_l0, pv_acc_l0c, O_tmp_ub)
         accumulate_output(O_tmp_ub, O_ub, alpha_ub)
 
-
     @T.macro
     def kv_manual(
         kv,
@@ -289,8 +290,11 @@ def flash_attention_fwd(
         with T.Stage(1):
             T.copy(K_shared[0:BC, 0:D], qk_b_l0)
             T.gemm(
-                qk_a_l0, qk_b_l0, qk_acc_l0c,
-                transpose_B=True, clear_accum=True,
+                qk_a_l0,
+                qk_b_l0,
+                qk_acc_l0c,
+                transpose_B=True,
+                clear_accum=True,
                 unit_flag_ctrl=3,
             )
         with T.Stage(3):
@@ -305,8 +309,11 @@ def flash_attention_fwd(
             T.copy(P_shared[0:BR, 0:BC], pv_a_l0)
             T.copy(V_shared[0:D, 0:BC], pv_b_l0)
             T.gemm(
-                pv_a_l0, pv_b_l0, pv_acc_l0c,
-                transpose_B=True, clear_accum=True,
+                pv_a_l0,
+                pv_b_l0,
+                pv_acc_l0c,
+                transpose_B=True,
+                clear_accum=True,
                 unit_flag_ctrl=3,
             )
         with T.Stage(7):
