@@ -3,7 +3,7 @@
 import pytest
 from tilelang import tvm
 from tilelang.ascend import language as T, transform
-from tilelang.layout import make_ascend_compact_nz_layout
+from tilelang.layout import make_ascend_compact_nz_layout, make_ascend_nz_layout
 from tvm import tirx
 from testing.ascend._ir import calls
 
@@ -269,3 +269,47 @@ def test_explicit_post_copy_checks_capacity_relative_to_view(elem_offset, index,
     else:
         with pytest.raises(ValueError, match="physical span exceeds"):
             transform.InsertNd2Nz()(before)
+
+
+# Lower a full FP8/FP4 ND tile to scatter plus UB-to-L1 post-copy.
+@pytest.mark.parametrize(
+    "dtype,cols,c_type",
+    [("float8_e4m3fn", 288, "fp8_e4_t"), ("float4_e2m1fn", 64, "float4_e2m1x2_t"), ("float4_e2m1fn", 576, "float4_e2m1x2_t")],
+)
+def test_low_precision_automatic_l1_scatter_lowering(dtype, cols, c_type):
+    @T.prim_func
+    def before():
+        with T.sblock("root"):
+            src = T.alloc_shared((16, cols), dtype)
+            dst = T.alloc_l1((16, cols), dtype)
+            T.sblock_attr({"layout_map": {dst: make_ascend_nz_layout(dst)}})
+            T.copy(src, dst)
+
+    after = transform.InsertNd2Nz()(tvm.IRModule({"main": before}))
+    (post_copy,) = calls(after, "tl.ascend_nd2nz_post_copy")
+    assert not calls(after, "tl.tileop.ascend_copy")
+    if cols == 64:
+        assert not calls(after, "tl.ascend_nd2nz_scatter")
+        assert [int(x) for x in post_copy.args[2:6]] == [16, 64, 16, 16]
+        return
+    (scatter,) = calls(after, "tl.ascend_nd2nz_scatter")
+    assert [str(x.value) for x in scatter.args[5:7]] == [c_type, c_type]
+    assert [int(x) for x in scatter.args[2:4]] == [16, cols]
+    assert [int(x) for x in post_copy.args[2:6]] == [16, cols, 17, 16]
+    analyzer = tvm.arith.Analyzer()
+    assert int(analyzer.simplify(scatter.args[0].args[1])) == 16 * cols
+    assert int(analyzer.simplify(scatter.args[1].args[1])) == 17 * cols
+
+
+@pytest.mark.parametrize("offset", [32, 64])
+def test_fp4_source_alignment_counts_bits(offset):
+    from testing.ascend._ir import copy, kernel
+
+    src = tirx.decl_buffer((16, 128), "float4_e2m1fn", scope="shared.dyn", elem_offset=offset)
+    dst = tirx.decl_buffer((16, 128), "float4_e2m1fn", scope="shared.l1")
+    before = kernel(copy(src, dst), buffers=[src, dst], annotations={"layout_map": {dst: make_ascend_nz_layout(dst)}})
+    if offset == 32:  # 32 FP4 values are only 16 bytes.
+        with pytest.raises(ValueError, match="32-byte-aligned"):
+            transform.InsertNd2Nz()(before)
+    else:
+        assert len(calls(transform.InsertNd2Nz()(before), "tl.ascend_nd2nz_scatter")) == 1

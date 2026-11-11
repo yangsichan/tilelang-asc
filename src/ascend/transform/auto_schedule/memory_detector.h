@@ -26,6 +26,7 @@
 #include "ascend/op/ascend_mte_plan.h"
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
+#include "ascend/op/nd2nz.h"
 #include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
 #include "op/builtin.h"
@@ -789,9 +790,12 @@ private:
         PrimExpr extent = ana_.Simplify(ResolveLets(call->args[1]));
         const auto *declared_extent = extent.as<IntImmNode>();
         const auto *declared_mask = call->args[2].as<IntImmNode>();
-        if (bytes && *bytes > 0 && dtype.is_scalar() && dtype.bits() >= 8 &&
-            dtype.bits() % 8 == 0 && declared_extent && declared_mask) {
-          int64_t elements = (*bytes - 1) / (dtype.bits() / 8) + 1;
+        if (bytes && *bytes > 0 && dtype.is_scalar() &&
+            *bytes <= std::numeric_limits<int64_t>::max() / 8 &&
+            (dtype.bits() == 4 ||
+             (dtype.bits() >= 8 && dtype.bits() % 8 == 0)) &&
+            declared_extent && declared_mask) {
+          int64_t elements = (*bytes * 8 - 1) / dtype.bits() + 1;
           // Keep the producer's conservative region, including padding. A
           // smaller physical span must not narrow its logical-view contract.
           if (elements <= std::numeric_limits<int32_t>::max() &&
@@ -862,22 +866,24 @@ private:
     if (op->args.size() == 7) {
       const auto *rows = op->args[2].as<IntImmNode>();
       const auto *cols = op->args[3].as<IntImmNode>();
-      auto element_bytes = [&](size_t index) -> int64_t {
+      auto element_bits = [&](size_t index) -> int64_t {
         const auto *dtype = op->args[index].as<StringImmNode>();
-        if (dtype && dtype->value == "float")
-          return 4;
-        if (dtype && (dtype->value == "half" || dtype->value == "bfloat16_t"))
-          return 2;
-        return 0;
+        return dtype ? Nd2NzElementBits(op->args[index]) : 0;
       };
       if (rows && cols && rows->value > 0 && cols->value > 0 &&
           rows->value < std::numeric_limits<int64_t>::max()) {
-        int64_t dst_bytes = element_bytes(6);
+        int64_t dst_bits = element_bits(6);
         if (scatter) {
-          int64_t src_bytes = element_bytes(5);
-          auto source_row = PhysicalSpan(cols->value, src_bytes, 0);
-          auto destination_row = PhysicalSpan(cols->value, dst_bytes, 0);
-          if (src_bytes && dst_bytes && source_row && destination_row) {
+          int64_t src_bits = element_bits(5);
+          auto row_bytes = [&](int64_t bits) -> std::optional<int64_t> {
+            auto span = PhysicalSpan(cols->value, bits, 0);
+            if (!span || *span % 8 != 0)
+              return std::nullopt;
+            return *span / 8;
+          };
+          auto source_row = row_bytes(src_bits);
+          auto destination_row = row_bytes(dst_bits);
+          if (src_bits && dst_bits && source_row && destination_row) {
             // The scatter template loads whole 256-byte vectors, including
             // the last partial vector of the last source row.
             int64_t vectors = (*source_row - 1) / 256 + 1;
@@ -885,8 +891,8 @@ private:
               source_bytes =
                   PhysicalSpan(rows->value - 1, *source_row, *last_row);
             const auto *pitch = op->args[4].as<IntImmNode>();
-            if (pitch && cols->value % (32 / dst_bytes) == 0) {
-              int64_t bursts = cols->value / (32 / dst_bytes);
+            if (pitch && cols->value % (256 / dst_bits) == 0) {
+              int64_t bursts = cols->value / (256 / dst_bits);
               if (auto blocks =
                       PhysicalSpan(bursts - 1, pitch->value, rows->value))
                 destination_bytes = PhysicalSpan(*blocks, 32, 0);
@@ -895,11 +901,11 @@ private:
         } else {
           const auto *src_pitch = op->args[4].as<IntImmNode>();
           const auto *dst_pitch = op->args[5].as<IntImmNode>();
-          if (dst_bytes && src_pitch && dst_pitch &&
+          if (dst_bits && src_pitch && dst_pitch &&
               src_pitch->value >= rows->value &&
               dst_pitch->value >= rows->value &&
-              cols->value % (32 / dst_bytes) == 0) {
-            int64_t bursts = cols->value / (32 / dst_bytes);
+              cols->value % (256 / dst_bits) == 0) {
+            int64_t bursts = cols->value / (256 / dst_bits);
             // Match lowering: both pitches are explicit 32-byte block strides.
             if (auto blocks =
                     PhysicalSpan(bursts - 1, src_pitch->value, rows->value))

@@ -1209,8 +1209,8 @@ private:
           << GetRef<Call>(op);
       ICHECK_GT(*rows, 0);
       ICHECK_GT(*cols, 0);
-      ICHECK(src_dtype->value == "float" || src_dtype->value == "half" ||
-             src_dtype->value == "bfloat16_t");
+      int source_bits = Nd2NzElementBits(op->args[5]);
+      Nd2NzElementBits(op->args[6]);
 
       const AscendLatencyParams::Nd2NzLatencyParams *profile =
           &params->nd2nz_same_dtype;
@@ -1226,7 +1226,7 @@ private:
         }
       }
 
-      int64_t vector_elements = src_dtype->value == "float" ? 64 : 128;
+      int64_t vector_elements = 2048 / source_bits;
       int64_t passes = *cols / vector_elements + (*cols % vector_elements != 0);
       int64_t row_iterations =
           CheckedSerialTaskMultiply(*rows, passes, "ND->NZ row iterations");
@@ -1595,10 +1595,10 @@ private:
   void RecordNd2NzPostCopy(const CallNode *op) {
     ICHECK_EQ(op->args.size(), 7)
         << "tl.ascend_nd2nz_post_copy expects 7 arguments";
-    int64_t element_bytes = Nd2NzElementBytes(op->args[6]);
+    int64_t element_bits = Nd2NzElementBits(op->args[6]);
     int64_t rows = EstimateExprUpperBound(op->args[2]);
     int64_t cols = EstimateExprUpperBound(op->args[3]);
-    int64_t bytes = SafeMultiply(SafeMultiply(rows, cols), element_bytes);
+    int64_t bytes = SafeMultiply(SafeMultiply(rows, cols), element_bits) / 8;
 
     features_.copy_infos.push_back({String("shared.dyn"), String("shared.l1"),
                                     bytes, /*dual_dst_ctl=*/0,
