@@ -50,27 +50,42 @@ def softmax_simd_fwd(batch, d):
         with T.Kernel(N_CORES) as core_id:
             x_ub = T.alloc_shared(rows * d, "float32")
             y_ub = T.alloc_shared(rows * d, "float32")
+            m_ub = T.alloc_shared(1, "float32")
+            l_ub = T.alloc_shared(1, "float32")
             T.annotate_buffer_versions({x_ub: 2, y_ub: 1})
             for t in T.Pipelined(iterations, num_stages=2):
                 base = (t * N_CORES + core_id) * rows * d
                 T.copy(X[base : base + rows * d], x_ub)
                 with T.SimdVF():
                     full = T.simd.pset(32, "PAT_ALL")
+                    one = T.simd.pset(32, "PAT_VL1")
                     for r in range(rows):
+                        # Running max/sum live in UB so they can persist across the
+                        # unrolled chunk loop; SIMD register values are region-scoped
+                        # and cannot cross the Python loop boundary.
+                        T.simd.vsts(m_ub[0], T.simd.vdup(-T.infinity("float32"), "float32", full), one, "ONEPT_B32")
+                        T.simd.vsts(l_ub[0], T.simd.vdup(T.float32(0.0), "float32", full), one, "ONEPT_B32")
+                        T.simd.mem_bar("VST_VLD")
+
                         # Fused online-softmax scan: single pass over the column
                         # chunks, updating running max m and running sum l.
-                        m = T.simd.vdup(-T.infinity("float32"), "float32", full)
-                        l = T.simd.vdup(T.float32(0.0), "float32", full)
                         for c in range(num_chunks):
                             s = T.simd.vld(x_ub[r * d + c * VL])
                             local_max = T.simd.vdupv(T.simd.vcmax(s, full), full, pos="POS_LOWEST")
-                            m_new = T.simd.vmax(m, local_max, full)
+                            old_m = T.simd.vld(m_ub[0], "BRC_B32")
+                            old_l = T.simd.vld(l_ub[0], "BRC_B32")
+                            m_new = T.simd.vmax(old_m, local_max, full)
                             e = T.simd.vexpdif(s, m_new, full)
                             row_sum = T.simd.vdupv(T.simd.vcadd(e, full), full, pos="POS_LOWEST")
-                            alpha = T.simd.vexpdif(m, m_new, full)  # exp(m_old - m_new)
-                            l = T.simd.vadd(T.simd.vmul(l, alpha, full), row_sum, full)
-                            m = m_new
+                            alpha = T.simd.vexpdif(old_m, m_new, full)  # exp(m_old - m_new)
+                            l_new = T.simd.vadd(T.simd.vmul(old_l, alpha, full), row_sum, full)
+                            T.simd.vsts(m_ub[0], m_new, one, "ONEPT_B32")
+                            T.simd.vsts(l_ub[0], l_new, one, "ONEPT_B32")
+                            T.simd.mem_bar("VST_VLD")
+
                         # Normalize: exp(x - m_final) / l_final.
+                        m = T.simd.vld(m_ub[0], "BRC_B32")
+                        l = T.simd.vld(l_ub[0], "BRC_B32")
                         for c in range(num_chunks):
                             s = T.simd.vld(x_ub[r * d + c * VL])
                             y = T.simd.vdiv(T.simd.vexpdif(s, m, full), l, full)

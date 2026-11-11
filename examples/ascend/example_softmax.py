@@ -20,9 +20,9 @@ from tilelang.profiler import do_bench
 
 
 def softmax_fwd(batch, d):
-    if batch <= 0 or batch % 64 or d <= 0:
-        raise ValueError("softmax expects a positive batch divisible by 64 and d > 0")
-    N_CORES = 64
+    if batch <= 0 or batch % 56 or d <= 0:
+        raise ValueError("softmax expects a positive batch divisible by 56 and d > 0")
+    N_CORES = 56
     TILE = tilelang.next_power_of_2(d)
     # Two compact row tiles (input + output), each rows * d float32 elements.
     # Fragments live in registers, so only the UB tiles count against the budget.
@@ -87,7 +87,7 @@ def ref_program(x):
     return torch.softmax(x.float(), dim=-1).to(x.dtype)
 
 
-def run_regression_perf(batch=4096, d=4096):
+def run_regression_perf(batch=3584, d=4096):
     kernel = tilelang.compile(softmax_fwd(batch, d), out_idx=-1)
     x = torch.randn(batch * d, device="npu")
     latency = do_bench(lambda: kernel(x), backend="msprof", _n_warmup=30, _n_repeat=50)
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bench", action=argparse.BooleanOptionalAction, default=True, help="benchmark after correctness checks")
     args = parser.parse_args()
-    batch, d = 128, 4096
+    batch, d = 224, 4096
     x = torch.randn(batch, d, device="npu")
     kernel = tilelang.compile(softmax_fwd(batch, d), out_idx=-1)
     y = kernel(x.flatten())
