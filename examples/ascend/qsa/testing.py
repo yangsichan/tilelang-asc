@@ -78,8 +78,7 @@ def fill_contract_corners(indices, kv_length, top_k):
     if indices.shape[0] > 1:
         indices[1, :8] = -1
     if indices.shape[0] > 2:
-        indices[2, top_k - 4:] = torch.tensor(
-            [kv_length - 3, kv_length - 2, kv_length - 1, -1], dtype=torch.int32)
+        indices[2, top_k - 4 :] = torch.tensor([kv_length - 3, kv_length - 2, kv_length - 1, -1], dtype=torch.int32)
 
 
 def run_qsa(kernel, q, k, v, indices):

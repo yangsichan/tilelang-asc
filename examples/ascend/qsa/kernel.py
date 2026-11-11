@@ -35,7 +35,8 @@ def _copy_kv_rows(dst, src, n_rows, row_stride, row_bytes):
         0,
         n_rows,
         row_bytes,
-        0, 0,
+        0,
+        0,
         0,
         0,
         row_stride * row_bytes,
@@ -279,10 +280,14 @@ def qsa_fwd(total_q, total_kv, top_k=2176, sm_scale=None, *, dynamic_shape=False
                                 f1 = S.vmul(o1, rp, full)
                                 c0 = S.vcvt(f0, dtype, full, sat=False, part=0)
                                 c1 = S.vcvt(f1, dtype, full, sat=False, part=1)
-                                S.vsts(O_out_ub[r, c], T.reinterpret(S.vor(
-                                    T.reinterpret(c0, "uint16x128"),
-                                    T.reinterpret(c1, "uint16x128"),
-                                    b16), "bfloat16x128"), b16, "NORM_B16")
+                                S.vsts(
+                                    O_out_ub[r, c],
+                                    T.reinterpret(
+                                        S.vor(T.reinterpret(c0, "uint16x128"), T.reinterpret(c1, "uint16x128"), b16), "bfloat16x128"
+                                    ),
+                                    b16,
+                                    "NORM_B16",
+                                )
                     # SimdVF blocks cannot touch GM; dual_copy stores AIV
                     # sid's half.
                     T.dual_copy(O_out_ub, O[grp, g, :, :])
