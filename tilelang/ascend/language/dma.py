@@ -20,8 +20,15 @@ _PAD_VALUE_SUPPORTED_DTYPES = frozenset(
         "int32",
         "uint32",
         "float32",
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float4_e2m1fn",
     }
 )
+
+# FP8/FP4 pad values are limited to the constant zero (physical byte 0x00) for
+# now; non-zero values are not implemented.
+_ZERO_ONLY_PAD_DTYPES = frozenset({"float8_e4m3fn", "float8_e5m2", "float4_e2m1fn"})
 
 
 def ascend_set_copy_pad_value(value, dtype=None) -> None:
@@ -40,8 +47,9 @@ def ascend_set_copy_pad_value(value, dtype=None) -> None:
         Padding fill value.
     dtype : str, optional
         Copy element dtype (one of int8/uint8/int16/uint16/float16/bfloat16/
-        int32/uint32/float32). Required when ``value`` is a Python literal;
-        for a typed PrimExpr it defaults to ``value.dtype``.
+        int32/uint32/float32, plus float8_e4m3fn/float8_e5m2/float4_e2m1fn,
+        which accept only the constant 0). Required when ``value`` is a Python
+        literal; for a typed PrimExpr it defaults to ``value.dtype``.
 
     Example
     -------
@@ -57,6 +65,12 @@ def ascend_set_copy_pad_value(value, dtype=None) -> None:
         raise ValueError(
             f"ascend_set_copy_pad_value does not support dtype {dtype!r}; supported dtypes are {sorted(_PAD_VALUE_SUPPORTED_DTYPES)}."
         )
+    if dtype in _ZERO_ONLY_PAD_DTYPES:
+        if not isinstance(value, (int, float)) or float(value) != 0.0:
+            raise ValueError(
+                f"ascend_set_copy_pad_value supports only the constant zero for dtype {dtype!r}; non-zero FP8/FP4 pad values are not yet implemented."
+            )
+        value = 0.0
     value = tirx.const(value, dtype) if isinstance(value, (int, float)) else tirx.Cast(dtype, value)
     return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_set_copy_pad_value"), value)
 
