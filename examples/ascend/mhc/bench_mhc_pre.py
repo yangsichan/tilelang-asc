@@ -8,8 +8,6 @@ from contextlib import nullcontext
 import math
 from pathlib import Path
 
-from examples.ascend.mhc._bench import capture_output, open_log
-
 
 HIDDEN_SIZES = (4096, 5120, 7168)
 LENGTHS = (1, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192)
@@ -40,7 +38,6 @@ def build_parser():
     parser.add_argument("--repeat", type=_positive, default=500)
     parser.add_argument("--seed", type=int, default=20261112)
     parser.add_argument("--output", type=Path, help="optional new CSV file; completed rows are flushed after every case")
-    parser.add_argument("--log-file", type=Path, help="optional new log file; defaults to a unique file in the temporary directory")
     parser.add_argument("--list-cases", action="store_true", help="list shapes without importing NPU dependencies")
     return parser
 
@@ -93,24 +90,19 @@ def main(argv=None):
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
     destination = args.output.open("x", newline="") if args.output else nullcontext(None)
-    with destination as output, open_log(args.log_file, "pre") as log:
-        print(f"Detailed log: {log.name}", flush=True)
+    with destination as output:
         writer = csv.writer(output) if output else None
         if writer:
             writer.writerow(("hidden", "length", "device_mean_us"))
             output.flush()
         for index, (hidden, n) in enumerate(cases, 1):
-            label = f"[{index:2d}/{len(cases)}] Pre  H={hidden} N={n:4d}"
-            print(label, end=" ... ", flush=True)
-            print(label, file=log, flush=True)
+            shape = f"Pre  H={hidden} N={n:4d}"
+            print(f"[RUN {index}/{len(cases)}] {shape}", flush=True)
             try:
-                with capture_output(log):
-                    latency = benchmark(n, hidden, args)
+                latency = benchmark(n, hidden, args)
             except Exception as exc:
-                print(f"FAILED; see {log.name}", flush=True)
-                raise RuntimeError(f"mHC Pre benchmark failed for H={hidden}, N={n}; details: {log.name}") from exc
-            print(f"device_mean_us={latency:10.3f}", flush=True)
-            print(f"device_mean_us={latency:.3f}", file=log, flush=True)
+                raise RuntimeError(f"mHC Pre benchmark failed for H={hidden}, N={n}") from exc
+            print(f"[RESULT {index}/{len(cases)}] {shape} device_mean_us={latency:10.3f}", flush=True)
             if writer:
                 writer.writerow((hidden, n, latency))
                 output.flush()

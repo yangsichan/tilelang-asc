@@ -37,7 +37,7 @@ def bench_with_msprof(
     n_repeat: int,
     detailed: bool = False,
 ) -> float:
-    """Benchmark using CANN task timing and pipe counters."""
+    """Benchmark using torch_npu msprof timing."""
     import shutil
     import signal
     import struct
@@ -47,7 +47,7 @@ def bench_with_msprof(
     from dataclasses import dataclass
     from pathlib import Path
 
-    from ._acl import profile as acl_profile
+    import torch_npu.profiler
 
     @dataclass
     class KernelProfile:
@@ -172,6 +172,9 @@ def bench_with_msprof(
                 os.environ[key] = old
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _nop_trace_ready(_prof):
+        pass
+
     def _parse_ffts_profile(prof_path: Path, n_repeat: int):
         hash_to_name: dict[int, str] = {}
         for f in prof_path.rglob("*hash_dic.slice_*"):
@@ -266,13 +269,25 @@ def bench_with_msprof(
     cache_flush_kernel(cache)
     torch.npu.synchronize()
 
-    with _defer_signals(), _prof_work_path() as directory, _suppress_output(True):
-        with acl_profile(directory, torch.npu.current_device(), torch.npu.synchronize):
+    with _defer_signals(), _prof_work_path(), _suppress_output(True):
+        with torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+            on_trace_ready=_nop_trace_ready,
+            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                l2_cache=False,
+                data_simplification=False,
+            ),
+        ) as prof:
             for _ in range(n_repeat):
                 cache_flush_kernel(cache)
                 fn()
+            torch.npu.synchronize()
+            prof.step()
 
-        kernel_profiles = _parse_ffts_profile(Path(directory), n_repeat)
+        kernel_profiles = _parse_ffts_profile(Path(prof.prof_if.prof_path), n_repeat)
 
     kernel_profiles = {name: profile for name, profile in kernel_profiles.items() if "_tilelang_profiler_cache_flush_kernel" not in name}
     if not kernel_profiles:

@@ -85,21 +85,18 @@ def test_csv_preserves_completed_cases_on_failure(benchmark_module, monkeypatch,
         "50",
         "--output",
         str(destination),
-        "--log-file",
-        str(tmp_path / "benchmark.log"),
     ]
     with pytest.raises(RuntimeError, match="H=4096, N=4096"):
         benchmark_module.main(arguments)
     assert calls == [(4096, 32, 5, 50), (4096, 4096, 5, 50)]
     saved = destination.read_text()
     assert list(csv.DictReader(io.StringIO(saved))) == [{"hidden": "4096", "length": "32", "device_mean_us": "3.5"}]
-    assert "profiling failed" in (tmp_path / "benchmark.log").read_text()
     with pytest.raises(FileExistsError):
         benchmark_module.main(arguments)
     assert destination.read_text() == saved
 
 
-def test_console_keeps_results_and_logs_python_native_and_child_output(benchmark_module, monkeypatch, tmp_path, capsys):
+def test_console_preserves_warnings_and_prints_each_result_on_one_line(benchmark_module, monkeypatch, capfd):
     def sample(n, hidden, args):
         print("Python compiler information")
         os.write(2, b"native compiler warning\n")
@@ -107,25 +104,11 @@ def test_console_keeps_results_and_logs_python_native_and_child_output(benchmark
         return 8.995
 
     monkeypatch.setattr(benchmark_module, "benchmark", sample)
-    log = tmp_path / "benchmark.log"
-    benchmark_module.main(["--hidden-sizes", "4096", "--lengths", "32", "--log-file", str(log)])
-    console = capsys.readouterr()
-    assert "H=4096 N=  32 ... device_mean_us=     8.995" in console.out
-    assert "compiler" not in console.out + console.err
-    saved = log.read_text()
-    assert "Python compiler information" in saved
-    assert "native compiler warning" in saved
-    assert "child compiler warning" in saved
-
-
-def test_log_capture_restores_native_streams_after_failure(tmp_path, capfd):
-    from examples.ascend.mhc._bench import capture_output
-
-    log_path = tmp_path / "failure.log"
-    with log_path.open("w") as log, pytest.raises(ValueError, match="kernel failed"), capture_output(log):
-        os.write(2, b"native error before failure\n")
-        raise ValueError("kernel failed")
-    os.write(2, b"console restored\n")
-    assert capfd.readouterr().err == "console restored\n"
-    assert "native error before failure" in log_path.read_text()
-    assert "ValueError: kernel failed" in log_path.read_text()
+    benchmark_module.main(["--hidden-sizes", "4096", "--lengths", "32"])
+    console = capfd.readouterr()
+    results = [line for line in console.out.splitlines() if line.startswith("[RESULT ")]
+    stage = "Pre " if benchmark_module is bench_mhc_pre else "Post"
+    assert results == [f"[RESULT 1/1] {stage} H=4096 N=  32 device_mean_us=     8.995"]
+    assert "Python compiler information" in console.out
+    assert "native compiler warning" in console.err
+    assert "child compiler warning" in console.out
