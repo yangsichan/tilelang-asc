@@ -17,6 +17,9 @@ Pre has one public entry module and two implementations; Post is self-contained:
 | `test_mhc_pre.py` | CPU routing checks and four-output device regressions |
 | `mhc_post.py` | TileKernels Post forward, input validation and cached compilation |
 | `test_mhc_post.py` | Post reference checks, stream handling and Pre/Post integration |
+| `bench_mhc_pre.py` | Standalone Pre device timing with `do_bench` |
+| `bench_mhc_post.py` | Standalone Post device timing with `do_bench` |
+| `test_mhc_benchmarks.py` | CPU checks for case selection and CSV reporting |
 
 ## Pre inputs and outputs
 
@@ -171,6 +174,54 @@ pipelines. A partial tile computes only valid rows and fills the Cube-facing
 NZ padding; an empty AIV half still participates in the synchronization
 protocol. Both implementations keep all Sinkhorn iterations in registers and
 read residuals once.
+
+## Benchmarks
+
+Run the independent Pre and Post benchmarks from the repository root:
+
+```bash
+python -m examples.ascend.mhc.bench_mhc_pre --output /tmp/mhc_pre.csv
+python -m examples.ascend.mhc.bench_mhc_post --output /tmp/mhc_post.csv
+```
+
+Each script measures 60 shapes: `H` in `{4096, 5120, 7168}` and the following
+20 token lengths. Running the commands sequentially measures all Pre cases,
+then all Post cases, for 120 groups in total.
+
+```text
+1, 16, 32, 64, 128, 256, 512, 768, 1024, 1536,
+2048, 2304, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192
+```
+
+Both scripts accept space-separated shape selections, the NPU device and the
+available core counts. For a short run:
+
+```bash
+python -m examples.ascend.mhc.bench_mhc_pre --hidden-sizes 4096 --lengths 32 4096 --warmup 5 --repeat 50
+python -m examples.ascend.mhc.bench_mhc_post --hidden-sizes 4096 --lengths 32 4096 --warmup 5 --repeat 50
+```
+
+Use `--device npu:1` to select another device. Pre accepts `--aic-cores` and
+`--vec-cores`; Post accepts `--vec-cores`. Defaults are 28 AIC and 56 AIV.
+`--list-cases` prints the selected shapes without importing NPU dependencies.
+Without `--output`, results go to the terminal only. A CSV destination must be
+a new file; each completed row is flushed so a later failure retains earlier
+results.
+
+Timing uses the repository's native `tilelang.profiler.do_bench` with
+`backend="msprof_detail"` and early stopping disabled, as in the FlashAttention
+example. Inputs, Pre binding, Post compilation and an initial synchronized
+execution are prepared before profiling. Each invocation allocates fresh
+outputs; Pre also allocates fresh MK workspaces when needed.
+
+Each shape uses one profile batch, with 30 warmup calls and 500 measured calls
+by default. The printed and CSV `device_mean_us` is the **device duration mean
+per invocation** in microseconds. The helper flushes L2 before each measured
+invocation using its default 256 MiB buffer and excludes that flush from the
+reported duration. For mixed Pre kernels it uses the AIC duration records;
+for Vector Post it uses the AIV records. Host validation, allocation and launch
+intervals are excluded from this metric. No Ascend C baseline or Pre/Post
+pipeline is run. Numerical correctness is checked by the separate tests below.
 
 ## Tests
 
