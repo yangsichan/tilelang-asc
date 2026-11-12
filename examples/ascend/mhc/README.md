@@ -204,15 +204,34 @@ python -m examples.ascend.mhc.bench_mhc_post --hidden-sizes 4096 --lengths 32 40
 Use `--device npu:1` to select another device. Pre accepts `--aic-cores` and
 `--vec-cores`; Post accepts `--vec-cores`. Defaults are 28 AIC and 56 AIV.
 `--list-cases` prints the selected shapes without importing NPU dependencies.
-Without `--output`, results go to the terminal only. A CSV destination must be
-a new file; each completed row is flushed so a later failure retains earlier
-results.
+The console prints one result line per shape with `device_mean_us`. Compilation,
+initialization and native warnings go to a unique log in the temporary directory;
+its path is printed before the first case. Use `--log-file /tmp/mhc_pre.log` to
+choose a new log destination. Failures still raise an error and retain their full
+traceback in that log. Without `--output`, no CSV is written. A CSV destination
+must be a new file; each completed row is flushed so a later failure retains
+earlier results.
 
 Timing uses the repository's native `tilelang.profiler.do_bench` with
 `backend="msprof_detail"` and early stopping disabled, as in the FlashAttention
 example. Inputs, Pre binding, Post compilation and an initial synchronized
 execution are prepared before profiling. Each invocation allocates fresh
 outputs; Pre also allocates fresh MK workspaces when needed.
+
+The msprof backend captures through CANN's ACL profiling API, requesting only
+ACL API tracking, task time and pipe counters (mask `0x7`). It does not request
+shape collection or use `torch_npu`'s optional feature negotiation. Older
+`torch_npu` versions print `Do not support feature: AICORE_SHAPE` when enumerating
+newer CANN feature names, even with shape recording disabled. Direct ACL capture
+avoids this compatibility warning while retaining the existing FFTS reader and
+device-duration metric. An active external profiling session must not overlap
+this benchmark's process-global CANN capture.
+
+The separate compiler flag-id warning reports temporary synchronization IDs
+above the hardware limit. The later `RewriteFlagToBuf` pass compacts IDs or
+converts excess flags to buffer synchronization; the warning is retained in
+the detailed log. This benchmark does not change kernel scheduling or disable
+compiler diagnostics.
 
 Each shape uses one profile batch, with 30 warmup calls and 500 measured calls
 by default. The printed and CSV `device_mean_us` is the **device duration mean
