@@ -142,6 +142,12 @@ Compilation is cached by H and Vector core count; N stays dynamic. Each call
 uses the current NPU stream and allocates a fresh output. Pass the actual
 available Vector core count through `num_vec_cores` when it differs from 56.
 
+Post explicitly uses normal L2 allocation (`l2_cache_ctrl=0`) for its output
+copy. This lets the cache accept output writes and retain data for the next
+layer. The generic non-allocating store policy limited Post throughput at
+medium token counts in device measurements; the mixing arithmetic, tile sizes
+and three buffer versions are unchanged.
+
 Only the forward path is included. No TileKernels installation is required.
 
 ## Pre dispatch and dataflow

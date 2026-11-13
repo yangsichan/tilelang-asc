@@ -75,7 +75,8 @@ def _mhc_post_kernel(comb_res_mix, residual, post_layer_mix, x, out, *, hidden: 
                     for mo in T.unroll(mhc, explicit=True):
                         S.vsts(out_ub[mo, col], S.vcvt(out_reg[mo], T.bfloat16), dist="PK_B32")
 
-            T.copy(out_ub, out[pid_n, 0, pid_h * h_blk])
+            # Allow L2 allocation for Post outputs consumed by the next layer.
+            T.copy(out_ub, out[pid_n, 0, pid_h * h_blk], l2_cache_ctrl=0)
 
 
 @functools.lru_cache(maxsize=32)
