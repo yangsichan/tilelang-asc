@@ -36,7 +36,7 @@ For aligned mask rows within the UB budget, the vector mask path:
 
 Eligibility requires T to be divisible by 256, T no larger than 8192, and `Ksel % 128 == 0`. The widened row and double-buffered index tile add at most approximately 33 KiB per AIV. There is no full sparse-selection flag cache. Other lengths and partial tiles retain the scalar mask path. The original raw mask-row staging rule remains T divisible by 32 and T no larger than 32768; larger or unaligned rows are read from GM. These are implementation choices, not new restrictions on valid input lengths.
 
-`compile_kernel` in the example returns the callable for the five input tensors. `make_inputs` and `reference_attention` in the test module provide test inputs and the FP32 Golden. `run` demonstrates one kernel call and prints the output shape and dtype; correctness and performance validation are separate. GBSA deployment, adaptation, and performance scripts are maintained separately from this directory.
+`compile_kernel` in the example returns the callable for the five input tensors. `make_inputs` and `reference_attention` in the example provide inputs and the FP32 Golden, reused by the tests. `run` checks one input at rtol=atol=0.01 and profiles the resident TileLang call with `msprof_detail`; compilation, input generation, and Golden are outside the timed callable. GBSA deployment, adaptation, and performance scripts are maintained separately from this directory.
 
 ## Run
 
@@ -72,11 +72,11 @@ The first four points had two rounds with five warmups and 20 repeats. The sq=81
 ## File organization
 
 - `core.py`: DSL kernel, sparse gathers, online softmax, head-group scheduling, and tiling configuration.
-- `example_glm_dsa.py`: compilation interface and a single runnable usage example.
-- `test_glm_dsa.py`: FP32 reference, test input generation, mask probes, and correctness regressions.
+- `example_glm_dsa.py`: compilation interface, sample inputs, FP32 reference, and a standalone accuracy check and TileLang benchmark.
+- `test_glm_dsa.py`: mask probes and correctness regressions, reusing the example reference and input generator.
 
 The file split preserves the device computation and does not introduce extra kernel launches.
-Run correctness checks with `python -m pytest -v -s test_glm_dsa.py`. The example entry point demonstrates a call; it does not perform accuracy or performance acceptance.
+Run correctness checks with `python -m pytest -v -s test_glm_dsa.py`. The example entry point checks accuracy and times TileLang only; it does not establish GBSA performance acceptance.
 
 The 2026-11-16 organization revision moves functions without changing the device algorithm. The hashes above describe historical single-file snapshots, not the split files. Local checks produced identical device source before and after the split for eight shapes. On Ascend 950 with 28 available Cube cores, the split revision passed all 17 regression tests and six supplementary boundary tests. Six performance shapes were measured in three rounds with four heads per task, using five warmups and 20 repeats (three warmups and five repeats for sq=8192). The framework base was `32684998`; the custom GBSA source was ops-transformer commit `aaad76f2b1a2f0d4aaf2a5fd531cff7aa9c1cc68`, in the same September 30 CANN environment used for the preceding run.
 
@@ -91,3 +91,6 @@ The 2026-11-16 organization revision moves functions without changing the device
 | 1 / 8192 / 8192 | 838.655 | 3.057x |
 
 TileLang's median of the three round medians differed by less than 0.5% from the preceding single-file run for every measured shape. These remain complete-call resident comparisons, not isolated AICore measurements. E2E did not meet 1.0x in every round for sq=17/T=2049. The largest shape retained cross-round variation (approximately 696-845 ms); large-shape accuracy checks sampled 16 query rows. No all-shape or model-level acceptance is claimed.
+
+
+The subsequent example-layout revision restores the shared FP32 reference and input generator to the example, following the FlashAttention examples. The DSL remains unchanged. On the same server, the example passed its B=1/sq=2/T=257 accuracy check and completed `msprof_detail` profiling; all 17 regressions and six supplementary boundary tests passed again. Across the same six shapes and three rounds, the minimum resident ratios were 2.478x, 1.915x, 1.198x, 3.776x, 2.387x, and 3.047x, respectively. E2E ratios also exceeded 1.0x in this run, but some rounds had substantial variability and sq=1 was nearly tied (minimum 1.00016x); this does not establish a stable E2E margin. Large-shape checks still sampled 16 query rows.

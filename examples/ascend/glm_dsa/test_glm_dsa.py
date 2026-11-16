@@ -1,7 +1,7 @@
 """Correctness tests for the GLM-5.3 DSA forward kernel.
 
 Every case runs on the NPU: the kernel output is compared against the float32
-per-query reference in this test module.  The reference loops over query rows
+per-query reference in ``example_glm_dsa``.  The reference loops over query rows
 in Python, so the shapes stay small.
 """
 
@@ -13,51 +13,11 @@ import tilelang.ascend.language as T
 from core import (
     FwdTiling,
     NUM_HEADS,
-    HEAD_DIM,
-    INDEX_TOPK,
-    SOFTMAX_SCALE,
     _expand_mask_row,
     _vector_mask_penalty,
 )
 
-from example_glm_dsa import compile_kernel
-
-
-def make_inputs(batch_size: int, seq_len: int, kv_len: int):
-    torch.manual_seed(88888888)
-    top_k = min(INDEX_TOPK, kv_len)
-    q = torch.randn((batch_size, NUM_HEADS, seq_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
-    k = torch.randn((batch_size, NUM_HEADS, kv_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
-    v = torch.randn((batch_size, NUM_HEADS, kv_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
-    # Dense top-k, exactly what the caller produces:
-    #   topk = min(index_topk, index_scores.shape[-1])
-    #   ind = index_scores.topk(topk, dim=-1).indices.to(torch.int32)
-    index_scores = torch.rand(batch_size, seq_len, kv_len, device="npu")
-    indices = index_scores.topk(top_k, dim=-1).indices.to(torch.int32)
-    mask = torch.rand(batch_size, 1, seq_len, kv_len, device="npu") > 0.1
-    return q, k, v, indices, mask
-
-
-def reference_attention(q, k, v, indices, mask):
-    """Per-query reference in float32; the gathered tiles are too large to hold at once."""
-    batch_size, heads, seq_len, dim = q.shape
-    mask_u8 = mask.view(torch.uint8) if mask.dtype == torch.bool else mask
-    out = torch.empty((batch_size, seq_len, heads, dim), dtype=torch.float32, device=q.device)
-    for batch in range(batch_size):
-        k_batch = k[batch]
-        v_batch = v[batch]
-        for query in range(seq_len):
-            # torch.gather/advanced indexing require int64 indices.
-            idx = indices[batch, query].long()
-            gathered_k = k_batch[:, idx, :].float()  # [H, Ksel, D]
-            gathered_v = v_batch[:, idx, :].float()
-            scores = torch.einsum("hd,hkd->hk", q[batch, :, query, :].float(), gathered_k) * SOFTMAX_SCALE
-            keep = mask_u8[batch, 0, query][idx].ne(0)  # [Ksel]
-            scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
-            # Softmax over an all-masked row is NaN; the kernel emits zeros there.
-            probabilities = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
-            out[batch, query] = torch.einsum("hk,hkd->hd", probabilities, gathered_v)
-    return out
+from example_glm_dsa import compile_kernel, make_inputs, reference_attention
 
 
 def _build_mask_flag_probe(kv_len):

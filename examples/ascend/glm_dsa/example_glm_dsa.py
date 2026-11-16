@@ -1,7 +1,8 @@
 """DSA forward example with per-head Q/K/V on Ascend 950.
 
-The DSL and tiling configuration live in core.py. Correctness references and
-regression cases live in test_glm_dsa.py. Each input shape is specialized at
+The DSL and tiling configuration live in core.py. This example provides the
+FP32 reference and a standalone accuracy check and benchmark; regression cases
+live in test_glm_dsa.py. Each input shape is specialized at
 compile time; mask bytes are nonzero for participating positions.
 """
 
@@ -9,11 +10,49 @@ import argparse
 
 import torch
 import tilelang
+from tilelang.profiler import do_bench
 
 from core import FwdTiling, HEAD_DIM, INDEX_TOPK, NUM_HEADS, SOFTMAX_SCALE, glm_dsa_fwd, pick_num_blocks
 
 # Re-export the builder/configuration for existing callers of this example.
 __all__ = ["FwdTiling", "HEAD_DIM", "INDEX_TOPK", "NUM_HEADS", "SOFTMAX_SCALE", "glm_dsa_fwd", "pick_num_blocks", "compile_kernel"]
+
+
+def make_inputs(batch_size: int, seq_len: int, kv_len: int):
+    torch.manual_seed(88888888)
+    top_k = min(INDEX_TOPK, kv_len)
+    q = torch.randn((batch_size, NUM_HEADS, seq_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
+    k = torch.randn((batch_size, NUM_HEADS, kv_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
+    v = torch.randn((batch_size, NUM_HEADS, kv_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
+    # Dense top-k, exactly what the caller produces:
+    #   topk = min(index_topk, index_scores.shape[-1])
+    #   ind = index_scores.topk(topk, dim=-1).indices.to(torch.int32)
+    index_scores = torch.rand(batch_size, seq_len, kv_len, device="npu")
+    indices = index_scores.topk(top_k, dim=-1).indices.to(torch.int32)
+    mask = torch.rand(batch_size, 1, seq_len, kv_len, device="npu") > 0.1
+    return q, k, v, indices, mask
+
+
+def reference_attention(q, k, v, indices, mask):
+    """Per-query reference in float32; the gathered tiles are too large to hold at once."""
+    batch_size, heads, seq_len, dim = q.shape
+    mask_u8 = mask.view(torch.uint8) if mask.dtype == torch.bool else mask
+    out = torch.empty((batch_size, seq_len, heads, dim), dtype=torch.float32, device=q.device)
+    for batch in range(batch_size):
+        k_batch = k[batch]
+        v_batch = v[batch]
+        for query in range(seq_len):
+            # torch.gather/advanced indexing require int64 indices.
+            idx = indices[batch, query].long()
+            gathered_k = k_batch[:, idx, :].float()  # [H, Ksel, D]
+            gathered_v = v_batch[:, idx, :].float()
+            scores = torch.einsum("hd,hkd->hk", q[batch, :, query, :].float(), gathered_k) * SOFTMAX_SCALE
+            keep = mask_u8[batch, 0, query][idx].ne(0)  # [Ksel]
+            scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
+            # Softmax over an all-masked row is NaN; the kernel emits zeros there.
+            probabilities = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
+            out[batch, query] = torch.einsum("hk,hkd->hd", probabilities, gathered_v)
+    return out
 
 
 def compile_kernel(batch_size, seq_len, kv_len, *, num_blocks=None, tiling=None):
@@ -26,20 +65,25 @@ def compile_kernel(batch_size, seq_len, kv_len, *, num_blocks=None, tiling=None)
 
 
 def run(batch_size=1, seq_len=448, *, kv_len=4096, num_blocks=None, tiling=None):
-    """Prepare one input and demonstrate the compiled kernel call."""
+    """Check one input against Golden, then profile the resident kernel call."""
     import torch_npu  # noqa: F401 - register the NPU tensor backend
 
     kernel = compile_kernel(batch_size, seq_len, kv_len, num_blocks=num_blocks, tiling=tiling)
-    torch.manual_seed(88888888)
-    q = torch.randn((batch_size, NUM_HEADS, seq_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
-    k = torch.randn((batch_size, NUM_HEADS, kv_len, HEAD_DIM), dtype=torch.bfloat16, device="npu")
-    v = torch.randn_like(k)
-    top_k = min(INDEX_TOPK, kv_len)
-    indices = torch.arange(top_k, dtype=torch.int32, device="npu").view(1, 1, top_k).expand(batch_size, seq_len, top_k).contiguous()
-    mask = torch.ones((batch_size, 1, seq_len, kv_len), dtype=torch.bool, device="npu")
-    output = kernel(q, k, v, indices, mask.view(torch.uint8))
+    q, k, v, indices, mask = make_inputs(batch_size, seq_len, kv_len)
+    mask_u8 = mask.view(torch.uint8)
+    expected = reference_attention(q, k, v, indices, mask)
+    output = kernel(q, k, v, indices, mask_u8)
     torch.npu.synchronize()
-    print(f"Output: shape={tuple(output.shape)}, dtype={output.dtype}", flush=True)
+    assert output.dtype == torch.bfloat16
+    assert output.shape == expected.shape and output.is_contiguous()
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=1e-2)
+    print("Accuracy PASS", flush=True)
+
+    # Compile, input preparation, and Golden are outside the timed callable.
+    prof = do_bench(lambda: kernel(q, k, v, indices, mask_u8), backend="msprof_detail", _n_warmup=30, _n_repeat=100)
+    flops = 4.0 * batch_size * seq_len * NUM_HEADS * HEAD_DIM * min(INDEX_TOPK, kv_len)
+    print(f"{prof.dur_us:.2f} us/iter | {prof.tflops(flops):.1f} TFLOPS", flush=True)
+    return prof.dur_ns / 1e6
 
 
 if __name__ == "__main__":
