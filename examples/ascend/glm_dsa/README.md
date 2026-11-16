@@ -1,6 +1,6 @@
 # GLM DSA forward on Ascend 950
 
-This directory contains the kernel and standalone example (`example_glm_dsa.py`), correctness tests (`test_glm_dsa.py`), and this README. The implementation follows the per-head Q/K/V contract below.
+This directory contains the DSL kernel (`core.py`), standalone example (`example_glm_dsa.py`), correctness tests (`test_glm_dsa.py`), and this README. The implementation follows the per-head Q/K/V contract below.
 
 ## Contract
 
@@ -36,7 +36,7 @@ For aligned mask rows within the UB budget, the vector mask path:
 
 Eligibility requires T to be divisible by 256, T no larger than 8192, and `Ksel % 128 == 0`. The widened row and double-buffered index tile add at most approximately 33 KiB per AIV. There is no full sparse-selection flag cache. Other lengths and partial tiles retain the scalar mask path. The original raw mask-row staging rule remains T divisible by 32 and T no larger than 32768; larger or unaligned rows are read from GM. These are implementation choices, not new restrictions on valid input lengths.
 
-`compile_kernel` returns the callable for the five input tensors. `make_inputs` and `reference_attention` provide sample inputs and the FP32 Golden. `run` checks one example and measures TileLang; it does not compare against GBSA. GBSA deployment, adaptation, and performance scripts are maintained separately from this directory.
+`compile_kernel` in the example returns the callable for the five input tensors. `make_inputs` and `reference_attention` in the test module provide test inputs and the FP32 Golden. `run` demonstrates one kernel call and prints the output shape and dtype; correctness and performance validation are separate. GBSA deployment, adaptation, and performance scripts are maintained separately from this directory.
 
 ## Run
 
@@ -68,3 +68,26 @@ The ratio is GBSA complete-call resident host latency divided by TileLang latenc
 | 8192 / 8192 | approximately 875.532 | approximately 2.95x |
 
 The first four points had two rounds with five warmups and 20 repeats. The sq=8192 point had one round with one warmup and three repeats, so it is a short sample. Large shapes compare 16 query rows against Golden; small shapes compare all query rows. Optional test configurations reached approximately 2.01x at sq=16 with one head per task and 3.15x at sq=448 with 64 heads per task. Neither changes the default configuration.
+
+## File organization
+
+- `core.py`: DSL kernel, sparse gathers, online softmax, head-group scheduling, and tiling configuration.
+- `example_glm_dsa.py`: compilation interface and a single runnable usage example.
+- `test_glm_dsa.py`: FP32 reference, test input generation, mask probes, and correctness regressions.
+
+The file split preserves the device computation and does not introduce extra kernel launches.
+Run correctness checks with `python -m pytest -v -s test_glm_dsa.py`. The example entry point demonstrates a call; it does not perform accuracy or performance acceptance.
+
+The 2026-11-16 organization revision moves functions without changing the device algorithm. The hashes above describe historical single-file snapshots, not the split files. Local checks produced identical device source before and after the split for eight shapes. On Ascend 950 with 28 available Cube cores, the split revision passed all 17 regression tests and six supplementary boundary tests. Six performance shapes were measured in three rounds with four heads per task, using five warmups and 20 repeats (three warmups and five repeats for sq=8192). The framework base was `32684998`; the custom GBSA source was ops-transformer commit `aaad76f2b1a2f0d4aaf2a5fd531cff7aa9c1cc68`, in the same September 30 CANN environment used for the preceding run.
+
+
+| B / sq / T | Split TileLang median, ms | Minimum resident GBSA / TileLang across three rounds |
+| --- | --- | --- |
+| 1 / 1 / 4097 | 0.260 | 2.518x |
+| 1 / 16 / 2048 | 1.608 | 1.903x |
+| 1 / 17 / 2049 | 2.707 | 1.186x |
+| 1 / 448 / 4096 | 34.539 | 3.766x |
+| 2 / 32 / 512 | 0.958 | 2.388x |
+| 1 / 8192 / 8192 | 838.655 | 3.057x |
+
+TileLang's median of the three round medians differed by less than 0.5% from the preceding single-file run for every measured shape. These remain complete-call resident comparisons, not isolated AICore measurements. E2E did not meet 1.0x in every round for sq=17/T=2049. The largest shape retained cross-round variation (approximately 696-845 ms); large-shape accuracy checks sampled 16 query rows. No all-shape or model-level acceptance is claimed.
