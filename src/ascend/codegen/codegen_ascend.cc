@@ -3803,11 +3803,9 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
   // Select the scalar-core implementation using the existing VF context.
   if (IsOutsideVF() && ret_dtype == DataType::Float(32) &&
       global_symbol == "sqrtf") {
-    global_symbol = "AscendC::Std::sqrt";
+    global_symbol = "::sqrt";
     if (!has_ascend_std_math_included_) {
       // The Std headers use AscendC annotations from kernel_operator.h.
-      decl_stream << "#include <kernel_operator.h>\n";
-      decl_stream << "#include <utils/std/cmath.h>\n";
       has_ascend_std_math_included_ = true;
     }
   }
