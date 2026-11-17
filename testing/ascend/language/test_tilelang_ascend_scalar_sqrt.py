@@ -52,7 +52,7 @@ def test_scalar_rsqrt_codegen_selects_backend_late():
     func = _math_kernel(T.rsqrt)
     ascend_source = tilelang.lower(func, target="ascend").kernel_source
     pto_source = tilelang.lower(func, target="pto").kernel_source
-    assert "/ AscendC::Std::sqrt(" in ascend_source
+    assert "/ ::sqrt(" in ascend_source
     assert "rsqrtf" not in ascend_source
     assert "/ pto.sqrt(" in pto_source
     assert "AscendC::Std::" not in pto_source
@@ -63,8 +63,8 @@ def test_mixed_scalar_simt_codegen_restores_execution_domain(math_op, intrinsic)
     """Codegen selects scalar math on both sides of a SIMT helper."""
     func = _mixed_math_kernel(lambda: T.SimtVF(threads=1), math_op)
     source = tilelang.lower(func, target="ascend").kernel_source
-    assert source.count("#include <utils/std/cmath.h>") == 1
-    assert source.count("AscendC::Std::sqrt(") == 2
+    assert source.count("#include <utils/std/cmath.h>") == 0
+    assert source.count("::sqrt(") == 2
     assert source.count(intrinsic + "(") == 1
 
 
