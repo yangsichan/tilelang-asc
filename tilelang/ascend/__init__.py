@@ -1,6 +1,7 @@
 from . import target  # noqa: F401
 from . import op  # noqa: F401
 from . import analysis  # noqa: F401
+from . import vsimd_ir as vsimd_ir  # noqa: F401
 from . import language as language  # noqa: F401
 from . import transform  # noqa: F401
 from . import pipeline  # noqa: F401

@@ -32,6 +32,12 @@ Layout MakeAscendNZLayout(const tirx::Buffer &buffer);
 Layout MakeAscendCompactNZLayout(const tirx::Buffer &buffer);
 bool IsAscendCompactNZLayout(const Layout &layout, const tirx::Buffer &buffer);
 
+// Canonical fractal NZ (MajorK: [col/C0, row/16, row%16, col%C0]) predicate.
+bool IsAscendCanonicalNZLayout(const Layout &layout,
+                               const tirx::Buffer &buffer);
+// Any Ascend NZ layout a store can scatter into (canonical or compact).
+bool IsAscendNZLayout(const Layout &layout, const tirx::Buffer &buffer);
+
 // Ascend NZ column fractal C0 = 32 bytes / element_size = 256 / element_bits
 // (16 for bf16/fp16, 32 for fp8, 8 for fp32).
 int AscendC0(int element_bits);

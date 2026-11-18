@@ -253,6 +253,22 @@ bool IsAscendCompactNZLayout(const Layout &layout, const Buffer &buffer) {
   return layout->IsEqual(expected.get());
 }
 
+bool IsAscendCanonicalNZLayout(const Layout &layout, const Buffer &buffer) {
+  if (!layout.defined() || !buffer.defined() || buffer->shape.size() < 2) {
+    return false;
+  }
+  int bits = buffer->dtype.bits();
+  if (bits <= 0 || 256 % bits != 0)
+    return false;
+  Layout expected = MakeAscendNZLayout(buffer);
+  return layout->IsEqual(expected.get());
+}
+
+bool IsAscendNZLayout(const Layout &layout, const Buffer &buffer) {
+  return IsAscendCompactNZLayout(layout, buffer) ||
+         IsAscendCanonicalNZLayout(layout, buffer);
+}
+
 static Layout MakeAscendL0CLayout2D(PrimExpr rows, PrimExpr cols) {
   PrimExpr frac = Integer(kAscendRowFractal);
   Var i = InputPlaceholder(0); // M row

@@ -6,6 +6,56 @@ from tilelang.transform import _ffi_api
 from . import z3_scheduler  # noqa: F401
 
 
+def AscendDumpVSimd():
+    """Debug pass: log the full P1 report (memory, capture/scope, region lift).
+
+    The pass returns the IR unchanged, so it can be dropped into any pipeline
+    position for investigation.
+    """
+    return _ffi_api.AscendDumpVSimd()  # type: ignore
+
+
+def AscendDumpVSimdReport(func):
+    """Return the combined P1 report for a PrimFunc (read-only)."""
+    return _ffi_api.AscendDumpVSimdReport(func)  # type: ignore
+
+
+def AscendAnalyzeSimdVFMemoryReport(func):
+    """Return a human-readable memory-legality report for a PrimFunc.
+
+    Parameters
+    ----------
+    func : tvm.tirx.PrimFunc
+        A function containing one or more ``SIMD_VF`` blocks.
+
+    Returns
+    -------
+    report : str
+        Per-VF/per-nest legality report. This function does not rewrite the IR.
+    """
+    return _ffi_api.AscendAnalyzeSimdVFMemoryReport(func)  # type: ignore
+
+
+def AscendAnalyzeSimdVFCaptureReport(func):
+    """Return a capture/scope report for a PrimFunc containing SIMD_VF blocks."""
+    return _ffi_api.AscendAnalyzeSimdVFCaptureReport(func)  # type: ignore
+
+
+def AscendAnalyzeSimdVFCaptureInfo(func):
+    """Return typed capture/scope results (list of dicts) for a PrimFunc."""
+    return _ffi_api.AscendAnalyzeSimdVFCaptureInfo(func)  # type: ignore
+
+
+def AscendAnalyzeVSimdRegionReport(func):
+    """Return the per-nest region lift/dump report for a PrimFunc."""
+    return _ffi_api.AscendAnalyzeVSimdRegionReport(func)  # type: ignore
+
+
+def AscendLiftVSimd():
+    """P1 pass: attach a ``tl.vsimd.region`` annotation to top-level Parallels."""
+    return _ffi_api.AscendLiftVSimd()  # type: ignore
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -192,6 +242,29 @@ def NormalizeAscendFractalStorage():
     return _ffi_api.NormalizeAscendFractalStorage()  # type: ignore
 
 
+def AscendPlanVSimd():
+    """P2 pass: plan liftable regions onto the ``T.Parallel`` they came from.
+
+    The body is unchanged. Every LIFTED region is planned independently and the
+    resulting ``tl.parallel_vectorize.VSimdRegionPlan`` is attached to that loop as
+    ``tl.vsimd.plan``; a LIFTED region the planner cannot handle is a hard error,
+    because leaving scalar code inside ``T.SimdVF`` is rejected by ccec. OPAQUE
+    (P1-rejected) regions are not planned. Only Parallel loops are considered:
+    tile-ops outside a Parallel belong to the regular tile-op lowering.
+    """
+    return _ffi_api.AscendPlanVSimd()  # type: ignore
+
+
+def AscendEmitVSimd():
+    """P3 pass: replace planned Parallel loops and strip P1/P2 annotations."""
+    return _ffi_api.AscendEmitVSimd()  # type: ignore
+
+
+def AscendVectorizeVSimd():
+    """P2 + P3: plan and emit the new ``tl.vsimd.region`` path."""
+    return _ffi_api.AscendVectorizeVSimd()  # type: ignore
+
+
 def AscendSimdVFLowerParallel():
     """Lower T.Parallel inside SIMD_VF blocks to MicroAPI register-level vector ops."""
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
@@ -334,6 +407,16 @@ __all__ = [
     "AnnotateMultiBufferEligible",
     "AscendRemoveNoOp",
     "AscendInsertOOBPadding",
+    "AscendDumpVSimd",
+    "AscendDumpVSimdReport",
+    "AscendAnalyzeSimdVFMemoryReport",
+    "AscendAnalyzeSimdVFCaptureReport",
+    "AscendAnalyzeSimdVFCaptureInfo",
+    "AscendAnalyzeVSimdRegionReport",
+    "AscendLiftVSimd",
+    "AscendPlanVSimd",
+    "AscendEmitVSimd",
+    "AscendVectorizeVSimd",
     "AscendSimdVFLowerParallel",
     "AscendThreadSync",
     "AscendLayoutInference",

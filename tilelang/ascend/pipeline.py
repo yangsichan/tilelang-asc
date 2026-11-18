@@ -137,7 +137,18 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = ascend_transform.LegalizeParallelToPTO()(mod)
         mod = ascend_transform.VectorizeParallelToPTO()(mod)
     else:
-        mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
+        # P1 metadata annotation -> P2 plan -> P3 replace. The three stages
+        # share one switch: without the P1 annotation P2/P3 have no input.
+        # A LIFTED region P2/P3 cannot vectorize fails here: leaving scalar
+        # code inside T.SimdVF is rejected by ccec. OPAQUE (P1-rejected) nests
+        # are not part of this chain and keep their original IR.
+        if pass_ctx.config.get(tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT, True):
+            # Fragment vectorization is not supported on this branch: P1 reports
+            # any top-level Parallel whose subtree touches a local.fragment
+            # buffer as OPAQUE, so the automatic chain does not plan it.
+            mod = ascend_transform.AscendLiftVSimd()(mod)
+            mod = ascend_transform.AscendVectorizeVSimd()(mod)
+        # mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
     mod = ascend_transform.AscendLowerTileOp()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
