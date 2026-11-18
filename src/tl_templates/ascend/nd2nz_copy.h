@@ -51,7 +51,8 @@ struct ascend_nd2nz_scatter_impl {
 template <int ROWS, int COLS, int DST_PITCH, typename T>
 struct ascend_nd2nz_scatter_impl<
     ROWS, COLS, DST_PITCH, T, T,
-    std::enable_if_t<(COLS * sizeof(T)) % 32 == 0>> {
+    std::enable_if_t<(COLS * sizeof(T)) % 32 == 0 &&
+                     !std::is_same_v<T, float4_e2m1x2_t>>> {
   __simd_callee__ static inline void apply(__ubuf__ T *src_ub,
                                            __ubuf__ T *dst_nz_ub) {
     static_assert(ROWS % 16 == 0, "ROWS must be a multiple of 16");
@@ -63,7 +64,9 @@ struct ascend_nd2nz_scatter_impl<
     int pass = 0;
     while (count > 0) {
       vector_bool mask;
-      if constexpr (sizeof(T) == 2) {
+      if constexpr (sizeof(T) == 1) {
+        mask = asc_update_mask_b8(count);
+      } else if constexpr (sizeof(T) == 2) {
         mask = asc_update_mask_b16(count);
       } else if constexpr (sizeof(T) == 4) {
         mask = asc_update_mask_b32(count);
@@ -79,6 +82,19 @@ struct ascend_nd2nz_scatter_impl<
       }
       ++pass;
     }
+  }
+};
+
+// FP4 dimensions count logical values; the byte scatter moves packed pairs.
+template <int ROWS, int COLS, int DST_PITCH>
+struct ascend_nd2nz_scatter_impl<ROWS, COLS, DST_PITCH, float4_e2m1x2_t,
+                                 float4_e2m1x2_t,
+                                 std::enable_if_t<COLS % 64 == 0>> {
+  __simd_callee__ static inline void
+  apply(__ubuf__ float4_e2m1x2_t *src_ub, __ubuf__ float4_e2m1x2_t *dst_nz_ub) {
+    ascend_nd2nz_scatter_impl<ROWS, COLS / 2, DST_PITCH, uint8_t, uint8_t>::
+        apply(reinterpret_cast<__ubuf__ uint8_t *>(src_ub),
+              reinterpret_cast<__ubuf__ uint8_t *>(dst_nz_ub));
   }
 };
 
