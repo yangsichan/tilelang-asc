@@ -64,12 +64,45 @@ def compile_kernel(batch_size, seq_len, kv_len, *, num_blocks=None, tiling=None)
     )
 
 
-def run(batch_size=1, seq_len=448, *, kv_len=4096, num_blocks=None, tiling=None):
-    """Check one input against Golden, then profile the resident kernel call."""
+def _validate_inputs(q, k, v, indices, mask):
+    """Validate the example input contract and infer the compile shape."""
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError("Q and K must be rank-four tensors")
+    batch_size, _, seq_len, _ = q.shape
+    kv_len = k.shape[2]
+    if min(batch_size, seq_len, kv_len) <= 0:
+        raise ValueError("B, sq and T must be positive")
+    ksel = min(INDEX_TOPK, kv_len)
+    for name, tensor, shape, dtype in (
+        ("q", q, (batch_size, NUM_HEADS, seq_len, HEAD_DIM), torch.bfloat16),
+        ("k", k, (batch_size, NUM_HEADS, kv_len, HEAD_DIM), torch.bfloat16),
+        ("v", v, (batch_size, NUM_HEADS, kv_len, HEAD_DIM), torch.bfloat16),
+        ("indices", indices, (batch_size, seq_len, ksel), torch.int32),
+        ("attention_mask", mask, (batch_size, 1, seq_len, kv_len), torch.bool),
+    ):
+        if tensor.shape != shape or tensor.dtype != dtype:
+            raise ValueError(f"{name} must have shape {shape} and dtype {dtype}; got {tuple(tensor.shape)} and {tensor.dtype}")
+
+    ordered = indices.cpu().sort(dim=-1).values
+    if (ordered[..., 0] < 0).any() or (ordered[..., -1] >= kv_len).any() or (ordered[..., 1:] == ordered[..., :-1]).any():
+        raise ValueError("Each query must have unique indices in [0, T)")
+    return batch_size, seq_len, kv_len
+
+
+def run(batch_size=1, seq_len=448, *, kv_len=4096, num_blocks=None, tiling=None, inputs=None):
+    """Check and profile a generated or caller-supplied (q, k, v, indices, mask) tuple.
+
+    When inputs are supplied, their shapes determine B, sq and T.
+    """
     import torch_npu  # noqa: F401 - register the NPU tensor backend
 
+    if inputs is None:
+        inputs = make_inputs(batch_size, seq_len, kv_len)
+    else:
+        batch_size, seq_len, kv_len = _validate_inputs(*inputs)
+        inputs = tuple(tensor.to("npu").contiguous() for tensor in inputs)
+    q, k, v, indices, mask = inputs
     kernel = compile_kernel(batch_size, seq_len, kv_len, num_blocks=num_blocks, tiling=tiling)
-    q, k, v, indices, mask = make_inputs(batch_size, seq_len, kv_len)
     mask_u8 = mask.view(torch.uint8)
     expected = reference_attention(q, k, v, indices, mask)
     output = kernel(q, k, v, indices, mask_u8)
@@ -88,8 +121,22 @@ def run(batch_size=1, seq_len=448, *, kv_len=4096, num_blocks=None, tiling=None)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seq-len", type=int, default=448)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--kv-len", type=int, default=4096)
+    parser.add_argument("--seq-len", type=int, help="Generated input query length (default: 448)")
+    parser.add_argument("--batch-size", type=int, help="Generated input batch size (default: 1)")
+    parser.add_argument("--kv-len", type=int, help="Generated input KV length (default: 4096)")
+    parser.add_argument("--inputs", help="PyTorch file containing q, k, v, indices and attention_mask tensors")
     args = parser.parse_args()
-    run(batch_size=args.batch_size, seq_len=args.seq_len, kv_len=args.kv_len)
+    if args.inputs is not None:
+        if any(dim is not None for dim in (args.batch_size, args.seq_len, args.kv_len)):
+            parser.error("--inputs infers shape from the tensors; omit the shape options")
+        sample = torch.load(args.inputs, map_location="cpu", weights_only=True)
+        names = ("q", "k", "v", "indices", "attention_mask")
+        if not isinstance(sample, dict) or any(not isinstance(sample.get(name), torch.Tensor) for name in names):
+            parser.error("--inputs must contain tensors named " + ", ".join(names))
+        run(inputs=tuple(sample[name] for name in names))
+    else:
+        run(
+            batch_size=1 if args.batch_size is None else args.batch_size,
+            seq_len=448 if args.seq_len is None else args.seq_len,
+            kv_len=4096 if args.kv_len is None else args.kv_len,
+        )
