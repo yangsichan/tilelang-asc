@@ -12,6 +12,7 @@ import tilelang.ascend.language as T
 
 from core import (
     FwdTiling,
+    INDEX_TOPK,
     NUM_HEADS,
     _expand_mask_row,
     _vector_mask_penalty,
@@ -42,6 +43,7 @@ def test_vector_mask_flags(kv_len):
     """Exact 0/1 flags, shuffled pairs and repeated calls with changed masks."""
     import torch_npu  # noqa: F401 - register the NPU tensor backend
 
+    print(f"Inputs: mask=[{kv_len}] uint8, indices=[128] int32", flush=True)
     kernel = tilelang.compile(_build_mask_flag_probe(kv_len), target="ascend", out_idx=-1)
     generator = torch.Generator().manual_seed(20261106)
     indices = torch.randperm(kv_len, generator=generator)[:128].int()
@@ -55,7 +57,19 @@ def test_vector_mask_flags(kv_len):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
+def _print_input_spec(batch_size, seq_len, kv_len, *, mask_mode, num_blocks="auto", heads_per_task=None):
+    if heads_per_task is None:
+        heads_per_task = FwdTiling().heads_per_task
+    ksel = min(INDEX_TOPK, kv_len)
+    print(
+        f"Inputs: B={batch_size}, sq={seq_len}, T={kv_len}, Ksel={ksel}, "
+        f"mask={mask_mode}, num_blocks={num_blocks}, heads_per_task={heads_per_task}",
+        flush=True,
+    )
+
+
 def _check(batch_size, seq_len, kv_len, num_blocks, mask_mode="mixed"):
+    _print_input_spec(batch_size, seq_len, kv_len, mask_mode=mask_mode, num_blocks=num_blocks)
     kernel = compile_kernel(batch_size, seq_len, kv_len, num_blocks=num_blocks)
     q, k, v, indices, attn_mask = make_inputs(batch_size, seq_len, kv_len)
     if mask_mode == "all_keep":
@@ -120,6 +134,7 @@ def test_both_halves_of_a_tile_contribute():
     AIV yields 0 (or 1) instead, because the other 64 columns stay masked.
     """
     batch_size, seq_len, kv_len, num_blocks = 1, 8, 128, 8
+    _print_input_spec(batch_size, seq_len, kv_len, mask_mode="all_keep", num_blocks=num_blocks)
     kernel = compile_kernel(batch_size, seq_len, kv_len, num_blocks=num_blocks)
     q = torch.zeros(batch_size, NUM_HEADS, seq_len, 256, dtype=torch.bfloat16, device="npu")
     k = torch.zeros(batch_size, NUM_HEADS, kv_len, 256, dtype=torch.bfloat16, device="npu")
@@ -138,6 +153,7 @@ def test_both_halves_of_a_tile_contribute():
 @pytest.mark.parametrize("seq_len,kv_len,heads_per_task", [(16, 2048, 32), (17, 2049, 2), (1, 257, 64)])
 def test_custom_tiling_auto_grid(seq_len, kv_len, heads_per_task):
     """A custom head group must select its grid without an explicit num_blocks."""
+    _print_input_spec(1, seq_len, kv_len, mask_mode="mixed", heads_per_task=heads_per_task)
     kernel = compile_kernel(1, seq_len, kv_len, tiling=FwdTiling(heads_per_task=heads_per_task))
     q, k, v, indices, mask = make_inputs(1, seq_len, kv_len)
     expected = reference_attention(q, k, v, indices, mask)
