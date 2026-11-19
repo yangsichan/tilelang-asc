@@ -1781,7 +1781,7 @@ private:
 
 // Ascend variant of the post-inference validator. SIMD_VF bodies are opaque
 // scalar CCE regions whose T.Parallel loops are lowered later by
-// AscendSimdVFLowerParallel and never carry loop-layout annotations, so the
+// AscendVectorizeVSimd and never carry loop-layout annotations, so the
 // "every parallel loop is annotated" invariant must not be checked inside
 // them.
 class AscendParallelLoopLayoutValidator : public ParallelLoopLayoutValidator {
