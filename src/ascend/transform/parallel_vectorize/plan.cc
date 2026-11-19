@@ -10,10 +10,12 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1951,10 +1953,10 @@ void ValidatePackedNzSegment(const VectorPlan &plan,
   }
 }
 
-/*! \brief Find the explicit layout of a store buffer (same buffer or shared
- * data var). */
-const Layout *LookupStoreLayout(const PlanOptions &options,
-                                const tirx::Buffer &buffer) {
+/*! \brief Find the explicit layout of a buffer (same buffer or shared data
+ * var). */
+const Layout *LookupBufferLayout(const PlanOptions &options,
+                                 const tirx::Buffer &buffer) {
   for (const auto &entry : options.layouts) {
     if (entry.first.same_as(buffer) ||
         entry.first->data.same_as(buffer->data)) {
@@ -1962,6 +1964,14 @@ const Layout *LookupStoreLayout(const PlanOptions &options,
     }
   }
   return nullptr;
+}
+
+/*! \brief Whether an explicit layout is the ND row-major identity map. */
+bool IsExplicitNdLayout(const Layout &layout, const tirx::Buffer &buffer) {
+  if (!layout.defined() || !buffer.defined())
+    return false;
+  Layout identity = makeAscendNDLayout(buffer);
+  return layout->IsEqual(identity.get());
 }
 
 /*! \brief Row-major linearized physical offset of a logical index under
@@ -2002,12 +2012,15 @@ StoreLayoutPlan ClassifyStoreLayout(const StorePlan &store,
                                     arith::Analyzer *analyzer) {
   StoreLayoutPlan result;
   const tirx::Buffer &buffer = store->spec->buffer;
-  const Layout *layout = LookupStoreLayout(options, buffer);
+  const Layout *layout = LookupBufferLayout(options, buffer);
   if (layout == nullptr || !layout->defined() ||
       layout->as<FragmentNode>() != nullptr) {
     return result; // no explicit (physical) layout: default ND
   }
   const std::string name = buffer->name.operator std::string();
+  if (IsExplicitNdLayout(*layout, buffer)) {
+    return result; // explicitly annotated ND: the plain contiguous store
+  }
   if (!IsAscendNZLayout(*layout, buffer)) {
     throw Unsupported(
         "store to '" + name +
@@ -2076,6 +2089,165 @@ StoreLayoutPlan ClassifyStoreLayout(const StorePlan &store,
   result.nz = true;
   result.block_stride = *block / c0;
   return result;
+}
+
+/*! \brief Every value node a store instantiates (value, mask, index). */
+std::vector<ValueNode> CollectStoreValues(const StorePlan &store) {
+  std::vector<ValueNode> values;
+  if (store->value.defined())
+    values.push_back(store->value);
+  if (store->mask.has_value() && store->mask.value().defined())
+    values.push_back(store->mask.value());
+  if (store->index.has_value() && store->index.value().defined())
+    values.push_back(store->index.value());
+  return values;
+}
+
+/*!
+ * \brief Reject loads from buffers with an explicit non-ND layout (Stage 2).
+ *
+ * Only a store consults the destination layout. A load is always addressed as
+ * the logical row-major offset, so reading an NZ-annotated buffer would
+ * silently fetch the wrong elements. Vectorized loads therefore stay ND-only;
+ * the nest is rejected here instead of being miscompiled (an NZ reader needs an
+ * explicit copy or a scatter-based recipe, neither of which is implemented).
+ */
+void ValidateLoadLayouts(const VectorPlan &plan, const PlanOptions &options) {
+  std::unordered_set<const ValueNodeNode *> seen;
+  std::unordered_set<const ffi::Object *> checked_buffers;
+  std::function<void(const ValueNode &)> walk = [&](const ValueNode &node) {
+    if (!node.defined() || !seen.insert(node.get()).second)
+      return;
+    if (node->access.has_value() && node->access.value().defined()) {
+      const AccessInfo &access = node->access.value();
+      const tirx::Buffer &buffer = access->buffer;
+      if (checked_buffers.insert(buffer->data.get()).second) {
+        const Layout *layout = LookupBufferLayout(options, buffer);
+        if (layout != nullptr && layout->defined() &&
+            layout->as<FragmentNode>() == nullptr &&
+            !IsExplicitNdLayout(*layout, buffer)) {
+          const std::string name = buffer->name.operator std::string();
+          if (IsAscendNZLayout(*layout, buffer)) {
+            throw Unsupported(
+                "load from '" + name +
+                "' has an Ascend NZ layout; NZ destinations are store-only, "
+                "so the nest would read logical row-major addresses from a "
+                "physical NZ buffer (copy it to an ND buffer first)");
+          }
+          throw Unsupported("load from '" + name +
+                            "' has an explicit non-ND layout; only ND loads "
+                            "are supported");
+        }
+      }
+    }
+    for (const ffi::ObjectRef &arg : node->args)
+      walk(Downcast<ValueNode>(arg));
+    if (node->predicate.has_value() && node->predicate.value().defined())
+      walk(Downcast<ValueNode>(node->predicate.value()));
+  };
+  for (const StorePlan &store : plan->pre_stores)
+    for (const ValueNode &value : CollectStoreValues(store))
+      walk(value);
+  for (const StorePlan &store : plan->stores)
+    for (const ValueNode &value : CollectStoreValues(store))
+      walk(value);
+  for (const StorePlan &store : plan->post_stores)
+    for (const ValueNode &value : CollectStoreValues(store))
+      walk(value);
+}
+
+/*!
+ * \brief Enforce the per-recipe element-dtype matrix on a built plan.
+ *
+ * The matrix in :func:`RecipeSupportsElem` is the single admission table: a
+ * recipe/dtype pair outside it has no verified instruction shape (64-bit
+ * integers and 4-bit floats are the notable absences), so it is rejected here
+ * with the recipe name instead of being deferred to ccec. ``vcvt`` is checked
+ * pair-wise against the same table the emitter uses.
+ */
+void ValidateValueDtypes(const VectorPlan &plan) {
+  std::unordered_set<const ValueNodeNode *> seen;
+  std::vector<ValueNode> stack;
+  auto push_store = [&](const StorePlan &store) {
+    for (const ValueNode &value : CollectStoreValues(store))
+      stack.push_back(value);
+  };
+  for (const StorePlan &store : plan->pre_stores)
+    push_store(store);
+  for (const StorePlan &store : plan->stores)
+    push_store(store);
+  for (const StorePlan &store : plan->post_stores)
+    push_store(store);
+  while (!stack.empty()) {
+    ValueNode node = stack.back();
+    stack.pop_back();
+    if (!node.defined() || !seen.insert(node.get()).second)
+      continue;
+    for (const ffi::ObjectRef &arg : node->args)
+      stack.push_back(Downcast<ValueNode>(arg));
+    if (node->predicate.has_value() && node->predicate.value().defined())
+      stack.push_back(Downcast<ValueNode>(node->predicate.value()));
+    if (node->is_uniform)
+      continue; // scalar TIR, no vector instruction
+    const std::string recipe = node->recipe.operator std::string();
+    if (!RecipeInDtypeMatrix(recipe))
+      continue; // imm / lane_index / predicate algebra: no element instruction
+    if (recipe == "vcmp" || recipe == "vcmps") {
+      // A compare produces a boolx256 mask; its matrix entry names the
+      // comparable *operand* element types.
+      for (const ffi::ObjectRef &arg : node->args) {
+        const ValueNode &operand = Downcast<ValueNode>(arg);
+        if (!operand.defined() || operand->is_uniform)
+          continue;
+        const std::string operand_elem =
+            ElemDtype(operand->dtype.operator std::string());
+        if (!RecipeSupportsElem(recipe, operand_elem)) {
+          throw Unsupported("recipe '" + recipe + "' has no verified '" +
+                                operand_elem +
+                                "' operand instruction (dtype matrix)",
+                            {}, "body.dtype_matrix");
+        }
+      }
+      continue;
+    }
+    if (recipe == "vcvt") {
+      if (node->args.empty())
+        continue;
+      const std::string src = ElemDtype(
+          Downcast<ValueNode>(node->args[0])->dtype.operator std::string());
+      const std::string dst = ElemDtype(node->dtype.operator std::string());
+      if (!VcvtSupportsPair(src, dst)) {
+        throw Unsupported("recipe 'vcvt' has no verified element pair '" + src +
+                              "' -> '" + dst + "' (dtype matrix)",
+                          {}, "body.dtype_matrix");
+      }
+      continue;
+    }
+    const std::string elem = ElemDtype(node->dtype.operator std::string());
+    if (!RecipeSupportsElem(recipe, elem)) {
+      throw Unsupported("recipe '" + recipe + "' has no verified '" + elem +
+                            "' instruction (dtype matrix) (store value '" +
+                            node->detail.operator std::string() + "')",
+                        {}, "body.dtype_matrix");
+    }
+  }
+  for (const StorePlan &store : plan->stores) {
+    if (!store->reduce.has_value() || !store->reduce.value().defined())
+      continue;
+    const auto *reduce_node = store->reduce.value().as<ReduceInfoNode>();
+    if (reduce_node == nullptr || !reduce_node->varying.has_value() ||
+        !reduce_node->varying.value().defined())
+      continue;
+    const std::string recipe = reduce_node->recipe.operator std::string();
+    const std::string elem =
+        ElemDtype(Downcast<ValueNode>(reduce_node->varying.value())
+                      ->dtype.operator std::string());
+    if (!RecipeSupportsElem(recipe, elem)) {
+      throw Unsupported("reduction recipe '" + recipe + "' has no verified '" +
+                            elem + "' instruction (dtype matrix)",
+                        {}, "body.dtype_matrix");
+    }
+  }
 }
 
 VectorPlan BuildPlanForAxis(
@@ -2330,6 +2502,10 @@ VectorPlan BuildPlanForAxis(
   writer->pre_stores = pre_stores;
   writer->post_stores = post_stores;
 
+  // Destination layouts (Stage 2): a load is always the logical row-major
+  // address, so only ND source buffers are readable.
+  ValidateLoadLayouts(plan, options);
+
   // Mixed element widths (Stage 1): a chunk narrower than some store register
   // is only proved for the straight-line element-wise subset.
   const bool partial_lanes = HasPartialLaneStore(plan);
@@ -2439,6 +2615,10 @@ VectorPlan BuildPlanForAxis(
   DropDeadPreStores(plan, analyzer);
   MarkStoreRoles(plan);
   MarkLiveChunkRange(plan, ctx);
+
+  // Per-recipe dtype matrix: reject a recipe/element pair with no verified
+  // instruction shape before P3 can emit it.
+  ValidateValueDtypes(plan);
 
   // A lane-varying predicate on a store to a lane-uniform address has no
   // vector form: several lanes would race on one scalar, which is a cross-lane

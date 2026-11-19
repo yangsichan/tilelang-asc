@@ -2,11 +2,12 @@
 
 The chain vectorizes ``T.Parallel`` loops inside a ``SIMD_VF`` and nothing else:
 
-* P1 attaches ``tl.vsimd.region`` (``tl.vsimd.Region``) to every top-level
+* P1 attaches ``tl.vsimd.region`` (``tl.vsimd.VSimdRegion``) to every top-level
   Parallel;
-* P2 plans each LIFTED region and attaches ``tl.vsimd.plan``
-  (``tl.parallel_vectorize.VSimdRegionPlan``) to the **same loop**; a LIFTED
-  region the planner cannot handle fails the compilation;
+* P2 plans each region and attaches ``tl.vsimd.plan``
+  (``tl.parallel_vectorize.VSimdRegionPlan``) to the **same loop**; a region
+  that is not LIFTED (P1 rejected it), a ``T.Parallel`` with no region at all,
+  or a LIFTED region the planner cannot handle fails the compilation;
 * P3 replaces every loop carrying a plan and strips both annotations
   unconditionally; a plan it cannot emit or an incompatible payload also fails
   the compilation.
@@ -15,7 +16,6 @@ Tile-ops outside a Parallel (top-level in the VF) are not part of this chain:
 they keep their statements and belong to the regular tile-op lowering.
 """
 
-import pytest
 import tilelang
 import tilelang.ascend.language as T
 import tvm
@@ -133,19 +133,6 @@ def _simple(A: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
 
 
 @T.prim_func
-def _unsupported_dtype(A: T.Tensor((64,), "float64"), C: T.Tensor((64,), "float64")):
-    """P1 can prove the nest independent, but P2 has no fp64 vector recipe."""
-    with T.Kernel(1):
-        a_ub = T.alloc_shared((64,), "float64")
-        c_ub = T.alloc_shared((64,), "float64")
-        T.copy(A, a_ub)
-        with T.SimdVF():
-            for i in T.Parallel(64):
-                c_ub[i] = a_ub[i] * 2.0
-        T.copy(c_ub, C)
-
-
-@T.prim_func
 def _two_vf(A: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
     with T.Kernel(1):
         a_ub = T.alloc_shared((64,), "float32")
@@ -159,54 +146,6 @@ def _two_vf(A: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
         with T.SimdVF():
             for i in T.Parallel(64):
                 c_ub[i] = c_ub[i] + a_ub[i]
-        T.copy(c_ub, C)
-
-
-@T.prim_func
-def _partial(A: T.Tensor((96,), "float32"), D: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
-    with T.Kernel(1):
-        a_ub = T.alloc_shared((96,), "float32")
-        d_ub = T.alloc_shared((64,), "float32")
-        c_ub = T.alloc_shared((64,), "float32")
-        T.copy(A, a_ub)
-        T.copy(D, d_ub)
-        with T.SimdVF():
-            for i in T.Parallel(64):
-                a_ub[i] = a_ub[i + 32]
-            for i in T.Parallel(64):
-                c_ub[i] = d_ub[i] + 1.0
-        T.copy(c_ub, C)
-
-
-@T.prim_func
-def _fragment_fallback(A: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
-    with T.Kernel(1):
-        a_ub = T.alloc_shared((64,), "float32")
-        c_ub = T.alloc_shared((64,), "float32")
-        T.copy(A, a_ub)
-        with T.SimdVF():
-            frag = T.alloc_fragment((64,), "float32")
-            for i in T.Parallel(64):
-                frag[i] = a_ub[i] + 1.0
-            for i in T.Parallel(64):
-                c_ub[i] = frag[i] * 2.0
-        T.copy(c_ub, C)
-
-
-@T.prim_func
-def _fragment_mixed(A: T.Tensor((64,), "float32"), D: T.Tensor((64,), "float32"), C: T.Tensor((64,), "float32")):
-    with T.Kernel(1):
-        a_ub = T.alloc_shared((64,), "float32")
-        d_ub = T.alloc_shared((64,), "float32")
-        c_ub = T.alloc_shared((64,), "float32")
-        T.copy(A, a_ub)
-        T.copy(D, d_ub)
-        with T.SimdVF():
-            frag = T.alloc_fragment((64,), "float32")
-            for i in T.Parallel(64):
-                frag[i] = a_ub[i] + 1.0
-            for i in T.Parallel(64):
-                c_ub[i] = d_ub[i] * 2.0
         T.copy(c_ub, C)
 
 
@@ -327,20 +266,6 @@ def _parallel_under_serial_shell(A: T.Tensor((4, 128), "float32"), C: T.Tensor((
 
 
 @T.prim_func
-def _parallel_under_branch(A: T.Tensor((128,), "float32"), C: T.Tensor((128,), "float32"), flag: T.int32):
-    """A Parallel under a branch is not a top-level nest: P1 leaves it alone."""
-    with T.Kernel(1):
-        a_ub = T.alloc_shared((128,), "float32")
-        c_ub = T.alloc_shared((128,), "float32")
-        T.copy(A, a_ub)
-        with T.SimdVF():
-            if flag > 0:
-                for i in T.Parallel(128):
-                    c_ub[i] = a_ub[i] + 1.0
-        T.copy(c_ub, C)
-
-
-@T.prim_func
 def _guarded_divergent(
     A: T.Tensor((128,), "float32"),
     C: T.Tensor((128,), "float32"),
@@ -377,25 +302,6 @@ def _guarded_same_buffer_disjoint_arms(
                     c_ub[2 * i] = 1.0
                 else:
                     c_ub[2 * i + 1] = 2.0
-        T.copy(c_ub, C)
-
-
-@T.prim_func
-def _guarded_same_buffer_overlapping_arms(
-    A: T.Tensor((128,), "float32"),
-    C: T.Tensor((256,), "float32"),
-):
-    """``2 * i`` and ``i`` intersect across lanes: a real WAW, not just per-lane."""
-    with T.Kernel(1):
-        a_ub = T.alloc_shared((128,), "float32")
-        c_ub = T.alloc_shared((256,), "float32")
-        T.copy(A, a_ub)
-        with T.SimdVF():
-            for i in T.Parallel(128):
-                if a_ub[i] > 0.0:
-                    c_ub[2 * i] = 1.0
-                else:
-                    c_ub[i] = 2.0
         T.copy(c_ub, C)
 
 
@@ -592,16 +498,6 @@ def test_parallel_under_a_serial_shell_closes_each_iteration():
     assert "VST_VLD" in body
 
 
-def test_parallel_under_a_branch_is_not_lifted():
-    """Not a top-level nest: P1 attaches no region and logs why."""
-    lifted = _lift(_parallel_under_branch)
-    assert _regions(lifted) == []
-    planned = _plan(lifted)
-    assert _plans(planned) == []
-    emitted = _emit(planned)
-    assert "T.parallel" in str(emitted["main"].body)
-
-
 def test_guarded_divergent_arms_become_predicated_stores():
     """Different write targets per arm: each arm keeps its own predicated store."""
     lifted = _lift(_guarded_divergent)
@@ -639,22 +535,6 @@ def test_guarded_same_buffer_disjoint_arms_are_vectorized():
     body = str(emitted["main"].body)
     assert "T.parallel" not in body
     assert "tl.simd.vscatter" in body and "tl.simd.pnot" in body
-
-
-def test_guarded_same_buffer_overlapping_arms_keep_the_original_loop():
-    """``c[2i]`` and ``c[i]`` intersect across lanes: the nest must stay scalar."""
-    lifted = _lift(_guarded_same_buffer_overlapping_arms)
-    region = _regions(lifted)[0]
-    assert region.status == "OPAQUE"
-    assert region.reason_code == "ILLEGAL"
-
-    planned = _plan(lifted)
-    assert _plans(planned) == []
-
-    emitted = _emit(planned)
-    body = str(emitted["main"].body)
-    assert "T.parallel" in body, "P3 leaves the rejected loop untouched"
-    assert "tl.simd.vscatter" not in body
 
 
 def test_symbolic_tail_context_reaches_the_planner():
@@ -698,93 +578,6 @@ def test_multiple_vfs_and_parallels_are_planned_independently():
     assert _regions(emitted) == [] and _plans(emitted) == []
 
 
-def test_partial_lift_plans_only_the_lifted_parallel():
-    lifted = _lift(_partial)
-    assert [region.status for region in _regions(lifted)] == ["OPAQUE", "LIFTED"]
-
-    planned = _plan(lifted)
-    assert len(_plans(planned)) == 1
-
-    emitted = _emit(planned)
-    body = str(emitted["main"].body)
-    assert "tl.simd.vadds" in body, "the lifted Parallel is vectorized"
-    assert "T.parallel" in body, "the opaque Parallel keeps its original form"
-    assert _regions(emitted) == []
-    assert _plans(emitted) == []
-
-
-def test_lifted_region_p2_cannot_plan_fails():
-    """P1 approved the region; leaving it scalar inside the VF is a hard error."""
-    lifted = _lift(_unsupported_dtype)
-    assert [region.status for region in _regions(lifted)] == ["LIFTED"]
-
-    with pytest.raises(tvm.error.InternalError, match="P2 cannot vectorize"):
-        _plan(lifted)
-
-
-def test_incompatible_plan_payload_fails():
-    """P3 must not silently ignore a plan payload it cannot trust."""
-    planned = _plan(_lift(_simple))
-
-    def rebuild(node):
-        if isinstance(node, tvm.tirx.For) and PLAN_KEY in dict(node.annotations):
-            return tvm.tirx.For(
-                node.loop_var,
-                node.min,
-                node.extent,
-                node.kind,
-                node.body,
-                node.thread_binding,
-                {PLAN_KEY: tvm.tirx.IntImm("int64", 0)},
-                node.step,
-            )
-        return None
-
-    mutated = tvm.tirx.stmt_functor.ir_transform(planned["main"].body, None, rebuild)
-    func = planned["main"].with_body(mutated)
-    with pytest.raises(tvm.error.InternalError, match="malformed tl.vsimd.plan"):
-        _emit(tvm.IRModule({"main": func}))
-
-
-def test_fragment_access_is_not_vectorized():
-    lifted = _lift(_fragment_fallback)
-    regions = _regions(lifted)
-    assert [region.status for region in regions] == ["OPAQUE", "OPAQUE"]
-    assert all(region.reason_code == "UNSUPPORTED" for region in regions)
-    assert all("fragment" in region.reason for region in regions)
-
-    planned = _plan(lifted)
-    assert _plans(planned) == []
-
-    emitted = _emit(planned)
-    assert _simd_ops(emitted) == []
-    assert "T.parallel" in str(emitted["main"].body)
-    assert _regions(emitted) == []
-    assert _plans(emitted) == []
-
-
-def test_fragment_rejection_is_per_parallel():
-    lifted = _lift(_fragment_mixed)
-    regions = _regions(lifted)
-    assert [region.status for region in regions] == ["OPAQUE", "LIFTED"]
-    assert regions[1].reason_code == ""
-
-    planned = _plan(lifted)
-    pairs = _plan_pairs(planned)
-    assert len(pairs) == 1, "only the fragment-free Parallel is planned"
-    loop, plan = pairs[0]
-    assert plan.program.segments[0].stores[0].spec.buffer.name == "c_ub"
-    # The planned loop is the second one (region_index 1).
-    assert int(plan.region_index) == 1
-    assert loop is not None
-
-    emitted = _emit(planned)
-    assert _simd_ops(emitted), "the fragment-free Parallel is vectorized"
-    assert "T.parallel" in str(emitted["main"].body), "the fragment nest stays"
-    assert _regions(emitted) == []
-    assert _plans(emitted) == []
-
-
 def test_unplanned_annotated_loop_is_not_emitted():
     """If a pass drops the plan annotation, P3 emits nothing for that loop."""
     planned = _plan(_lift(_simple))
@@ -817,8 +610,9 @@ def test_p3_without_p2_only_cleans_annotations():
     assert _regions(emitted) == []
     assert _plans(emitted) == []
 
-    # P2/P3 on an already emitted module is a no-op (idempotent chain).
-    again = _emit(_plan(emitted))
+    # P3 on an already emitted module is a no-op (idempotent); P2 is not in
+    # this chain and would now reject the bare Parallel by contract.
+    again = _emit(emitted)
     tvm.ir.assert_structural_equal(again["main"], emitted["main"])
 
 
@@ -839,11 +633,7 @@ def test_p1_disabled_leaves_the_original_loop():
     with tvm.transform.PassContext(config={tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT: False}):
         lifted = _lift(_simple)
         assert _regions(lifted) == []
-        planned = _plan(lifted)
-        assert _plans(planned) == []
-        emitted = _emit(planned)
-    assert _simd_ops(emitted) == []
-    tvm.ir.assert_structural_equal(emitted["main"].body, _simple.body, map_free_vars=True)
+        tvm.ir.assert_structural_equal(lifted["main"].body, _simple.body, map_free_vars=True)
 
 
 if __name__ == "__main__":

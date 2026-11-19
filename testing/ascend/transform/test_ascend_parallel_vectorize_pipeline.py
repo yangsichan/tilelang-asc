@@ -1,8 +1,9 @@
 """P1 delivery and P1→P2→P3 pass-pipeline contract tests.
 
 Offline: checks the annotation hand-off between ``AscendLiftVSimd`` →
-``AscendPlanVSimd`` → ``AscendEmitVSimd``, idempotence, rejected nests staying
-byte-identical, and the ``AscendVectorizeVSimd`` pipeline switch.
+``AscendPlanVSimd`` → ``AscendEmitVSimd``, idempotence, and the
+``TL_ASCEND_SIMD_LIFT`` switch (on: the three staged passes; off: the legacy
+``AscendSimdVFLowerParallel``).
 """
 
 from __future__ import annotations
@@ -49,13 +50,12 @@ from testing.ascend.transform._parallel_vectorize_helpers import (
 # transpose/flatten, mixed width, NZ, ...). This group does not repeat those
 # assertions and only covers three things:
 #
-#   * delivery: a LIFTED nest can be fed to ``build_plan`` directly; a rejected
-#     nest is recorded as OPAQUE/with a reason (P1 keeps one representative case);
+#   * delivery: a LIFTED nest can be fed to ``build_plan`` directly;
 #   * staging: P1/P2/P3 hand off through the ``tl.vsimd.region`` /
-#     ``tl.vsimd.plan`` annotations (both attached to the Parallel), are
-#     idempotent, and leave a rejected nest byte-identical;
-#   * pipeline: ``AscendVectorizeVSimd`` is the only entry point of the new path
-#     and runs under the default PassContext.
+#     ``tl.vsimd.plan`` annotations (both attached to the Parallel) and are
+#     idempotent;
+#   * pipeline: the three staged passes run under the default PassContext and
+#     ``TL_ASCEND_SIMD_LIFT=False`` selects the legacy lowering.
 
 
 # ---------------------------------------------------------------------------
@@ -173,54 +173,65 @@ def test_passes_are_idempotent():
     tvm.ir.assert_structural_equal(again.body, combined.body, map_free_vars=True)
 
 
-def test_rejected_nests_fall_through_every_stage():
-    # P1 rejects it (illegal memory) => recorded as OPAQUE (not liftable) and the IR
-    # stays byte-identical; the new chain leaves it alone too.
-    n = 256
-
-    @T.prim_func
-    def main(A: T.Tensor((n,), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((n,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                for i in T.Parallel(n - 32):
-                    a_ub[i] = a_ub[i + 32]
-
-    illegal = main
-    lifted = _run_lift(illegal)
-    # P1 still records the nest, but as an OPAQUE region (memory legality is
-    # ILLEGAL): nothing is liftable, so the body is byte-identical.
-    regions = _region_annotations(lifted.body)
-    assert regions and all(region.status != "LIFTED" for region in regions)
-    # P2 writes no plan (nothing is liftable) and P3 restores the original body.
-    assert _region_plans(_run_plan(lifted).body) == []
-    tvm.ir.assert_structural_equal(_run_new_path(illegal).body, illegal.body, map_free_vars=True)
-
-
 # ---------------------------------------------------------------------------
 # Pipeline integration: P1/P2/P3 share one switch
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def pass_calls(monkeypatch) -> list:
-    """Record how often the pipeline constructs the pass."""
-    calls: list = []
-    real = at.AscendVectorizeVSimd
+def pass_calls(monkeypatch) -> dict:
+    """Record how often the pipeline constructs each Parallel lowering pass."""
+    calls = {"plan": 0, "emit": 0, "legacy": 0}
 
-    def spy():
-        calls.append(True)
-        return real()
+    def spy(key, real):
+        def wrapped():
+            calls[key] += 1
+            return real()
 
-    monkeypatch.setattr(at, "AscendVectorizeVSimd", spy)
+        return wrapped
+
+    monkeypatch.setattr(at, "AscendPlanVSimd", spy("plan", at.AscendPlanVSimd))
+    monkeypatch.setattr(at, "AscendEmitVSimd", spy("emit", at.AscendEmitVSimd))
+    monkeypatch.setattr(at, "AscendSimdVFLowerParallel", spy("legacy", at.AscendSimdVFLowerParallel))
     return calls
 
 
-def test_disabling_the_lift_skips_the_whole_chain(pass_calls):
-    _lower_source(
+def test_disabling_the_lift_uses_the_legacy_lowering(pass_calls):
+    source = _lower_source(
         _p1_kernel_1d(),
         config={tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT: False},
     )
 
-    assert pass_calls == [], "P2/P3 must not run without the P1 annotation"
+    assert pass_calls["plan"] == 0 and pass_calls["emit"] == 0, "P2/P3 must not run without the P1 annotation"
+    assert pass_calls["legacy"] == 1, "the switch selects the legacy Parallel lowering"
+    assert "simd_inst::" in source, "the legacy lowering still reaches the vector ISA"
+
+
+def test_disabling_the_lift_lowers_a_fragment_parallel():
+    """P1 rejects fragments; the legacy path is the documented escape hatch."""
+    n = 64
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                frag = T.alloc_fragment((n,), "float32")
+                for i in T.Parallel(n):
+                    frag[i] = a_ub[i] + 1.0
+                for i in T.Parallel(n):
+                    c_ub[i] = frag[i] * 2.0
+            T.copy(c_ub, C)
+
+    source = _lower_source(main, config={tilelang.PassConfigKey.TL_ASCEND_SIMD_LIFT: False})
+    assert "simd_inst::" in source
+
+
+def test_default_path_runs_the_three_staged_chain(pass_calls):
+    source = _lower_source(_p1_kernel_1d())
+
+    assert pass_calls["plan"] == 1 and pass_calls["emit"] == 1
+    assert pass_calls["legacy"] == 0
+    assert "simd_inst::" in source

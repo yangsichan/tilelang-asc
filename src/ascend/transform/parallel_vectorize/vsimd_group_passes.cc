@@ -128,38 +128,98 @@ void FailUnvectorizedRegion(const char *stage, int64_t vf_index,
   LOG(FATAL) << message.str();
 }
 
+/*! \brief Short P1 summary for a reason code (mirrors the P1 warning text). */
+const char *P1RejectionSummary(const ffi::String &reason_code) {
+  if (reason_code == vsimd::reason_code::kIllegal)
+    return "parallel independence violation";
+  if (reason_code == vsimd::reason_code::kUnproven)
+    return "parallel independence could not be proven";
+  if (reason_code == vsimd::reason_code::kInternal)
+    return "internal compiler consistency check failed";
+  return "automatic lifting is unsupported";
+}
+
+/*!
+ * \brief Fail on a region P1 did not lift (status != LIFTED).
+ *
+ * Leaving an OPAQUE nest in a ``T.SimdVF`` would lower to scalar instructions,
+ * which ccec rejects far from the cause. P2 is the fail-fast gate: it prints
+ * P1's reason code / reason and repeats the warning P1 logged, then aborts.
+ * ``TL_ASCEND_SIMD_LIFT=False`` selects the legacy Parallel lowering instead.
+ */
+[[noreturn]] void FailOpaqueRegion(int64_t vf_index, int64_t region_index,
+                                   const vsimd::VSimdRegion &region) {
+  std::ostringstream message;
+  message << "[vsimd] P2 cannot lower VF#" << vf_index << " region#"
+          << region_index << ": P1 status=" << region->status
+          << " (reason_code=" << region->reason_code << "): " << region->reason;
+  message << "\nP1 reported: [vsimd][P1][" << region->reason_code << "] VF#"
+          << vf_index << " region#" << region_index << ": "
+          << P1RejectionSummary(region->reason_code) << "; " << region->reason
+          << "; original IR retained; no successful fallback is implied";
+  message << "\nLeaving scalar code inside T.SimdVF is rejected by ccec; fix "
+             "the nest so P1 can lift it, or set TL_ASCEND_SIMD_LIFT=False to "
+             "use the legacy Parallel lowering.";
+  LOG(FATAL) << message.str();
+}
+
+/*!
+ * \brief Fail on a ``T.Parallel`` P1 never visited (no region annotation).
+ *
+ * P1 only annotates nests reachable through ``SeqStmt`` / transparent
+ * attributes / serial shells. A Parallel nested under a branch or a ``while``
+ * is not part of that model; P1 logs a warning and P2 must fail instead of
+ * leaving it scalar inside the VF.
+ */
+[[noreturn]] void FailUnliftedParallel(int64_t vf_index) {
+  std::ostringstream message;
+  message << "[vsimd] P2 cannot lower a T.Parallel in VF#" << vf_index
+          << " that P1 did not lift: the loop has no P1 region (it is nested "
+             "under a branch or a while loop)";
+  message << "\nP1 reported: [vsimd][P1][UNSUPPORTED] VF#" << vf_index
+          << ": T.Parallel loop(s) have no P1 region (nested under a branch "
+             "or a while loop); original IR retained; no successful fallback "
+             "is implied";
+  message << "\nLeaving scalar code inside T.SimdVF is rejected by ccec; "
+             "hoist the loop to the top level of the VF, or set "
+             "TL_ASCEND_SIMD_LIFT=False to use the legacy Parallel lowering.";
+  LOG(FATAL) << message.str();
+}
+
 /*!
  * \brief Plan every annotated top-level Parallel of one VF.
  *
- * A LIFTED annotated loop is planned and gets ``tl.vsimd.plan``. A LIFTED
- * region the planner cannot handle is a hard error: it would otherwise remain
- * scalar inside the VF. OPAQUE regions are P1-owned and are left untouched.
- * Nothing else in the VF body is inspected, so top-level tile-ops are not
- * consumed by this chain.
+ * Every Parallel in the VF must carry a LIFTED P1 region: an OPAQUE region or
+ * an unannotated Parallel aborts with P1's reason instead of remaining scalar
+ * inside the VF. Nothing else in the VF body is inspected, so top-level
+ * tile-ops are not consumed by this chain.
  */
 class VfRegionPlanner final : public StmtMutator {
 public:
-  explicit VfRegionPlanner(
-      const std::vector<std::pair<Buffer, Layout>> &layouts)
-      : layouts_(layouts) {}
+  VfRegionPlanner(const std::vector<std::pair<Buffer, Layout>> &layouts,
+                  int64_t vf_index)
+      : layouts_(layouts), vf_index_(vf_index) {}
 
   Stmt VisitStmt_(const ForNode *op) final {
     auto it = op->annotations.find(kRegionKey);
-    if (it == op->annotations.end())
+    if (it == op->annotations.end()) {
+      if (op->kind == ForKind::kParallel)
+        FailUnliftedParallel(vf_index_);
       return StmtMutator::VisitStmt_(op);
+    }
 
     For loop = ffi::GetRef<For>(op);
     auto region = (*it).second.as<vsimd::VSimdRegion>();
     if (!region.has_value() || !region.value().defined()) {
-      LOG(WARNING) << "[vsimd] P2 ignored a malformed tl.vsimd.region "
-                      "annotation";
-      return loop;
+      LOG(FATAL) << "[vsimd] P2 found a malformed tl.vsimd.region annotation "
+                    "on VF#"
+                 << vf_index_
+                 << "; leaving the loop scalar inside T.SimdVF is rejected by "
+                    "ccec";
     }
     const vsimd::VSimdRegion &typed = region.value();
     if (typed->status != String(vsimd::region_status::kLifted)) {
-      // P1 already decided this nest is outside the automatic chain (OPAQUE).
-      // Keep its original IR; this pass neither plans nor rewrites it.
-      return loop;
+      FailOpaqueRegion(vf_index_, typed->region_index, typed);
     }
     try {
       VectorProgram program =
@@ -176,6 +236,7 @@ public:
 
 private:
   const std::vector<std::pair<Buffer, Layout>> &layouts_;
+  int64_t vf_index_{0};
 };
 
 /*! \brief Walk the function and plan the regions of every SIMD_VF. */
@@ -188,12 +249,15 @@ public:
     SBlock block = ffi::GetRef<SBlock>(op);
     const std::vector<std::pair<Buffer, Layout>> layouts =
         CollectVfLayouts(block->body);
-    VfRegionPlanner planner(layouts);
+    VfRegionPlanner planner(layouts, vf_index_++);
     Stmt body = planner(block->body);
     if (!body.same_as(block->body))
       block.CopyOnWrite()->body = body;
     return block;
   }
+
+private:
+  int64_t vf_index_{0};
 };
 
 /*! \brief Drop the P1/P2 annotations of a loop, keeping everything else. */

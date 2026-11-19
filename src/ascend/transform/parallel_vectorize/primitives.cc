@@ -110,6 +110,99 @@ const std::unordered_set<std::string> &IndexValueOps() {
   return table;
 }
 
+/*!
+ * \brief The per-recipe element-dtype matrix.
+ *
+ * Only the element widths with a verified instruction shape are listed: 8/16/
+ * 32-bit integers and 16/32-bit floats for data arithmetic, the float family
+ * for the SFU recipes, integers for the bitwise/shift recipes, and 8-bit
+ * floats only where they are moved or converted. 64-bit integers and 4-bit
+ * floats are intentionally absent (they have lane widths but no device
+ * evidence, so they must be rejected instead of reaching ccec).
+ */
+const std::unordered_map<std::string, std::unordered_set<std::string>> &
+RecipeDtypeMatrix() {
+  static const std::unordered_set<std::string> kArith = {
+      "int8",   "uint8",   "int16",    "uint16", "int32",
+      "uint32", "float16", "bfloat16", "float32"};
+  static const std::unordered_set<std::string> kFloat = {"float16", "float32"};
+  static const std::unordered_set<std::string> kInteger = {
+      "int8", "uint8", "int16", "uint16", "int32", "uint32"};
+  static const std::unordered_set<std::string> kMove = {
+      "int8",          "uint8",       "int16",         "uint16",  "int32",
+      "uint32",        "float16",     "bfloat16",      "float32", "float8_e4m3",
+      "float8_e4m3fn", "float8_e5m2", "float8_e8m0fnu"};
+  static const std::unordered_map<std::string, std::unordered_set<std::string>>
+      table = {
+          // Elementwise binary.
+          {"vadd", kArith},
+          {"vsub", kArith},
+          {"vmul", kArith},
+          {"vmax", kArith},
+          {"vmin", kArith},
+          {"vdiv", kFloat},
+          {"vand", kInteger},
+          {"vor", kInteger},
+          {"vxor", kInteger},
+          {"vshl", kInteger},
+          {"vshr", kInteger},
+          // Scalar-vector binary.
+          {"vadds", kArith},
+          {"vmuls", kArith},
+          {"vmaxs", kArith},
+          {"vmins", kArith},
+          {"vshrs", kInteger},
+          {"vshls", kInteger},
+          // Elementwise unary.
+          {"vneg", kArith},
+          {"vabs", kArith},
+          {"vexp", kFloat},
+          {"vsqrt", kFloat},
+          {"vln", kFloat},
+          // Compare / select / reinterpret.
+          {"vcmp", kArith},
+          {"vcmps", kArith},
+          {"vsel", kArith},
+          {"reinterpret", kInteger},
+          // Loads, broadcasts and cross-lane reductions.
+          {"vload", kMove},
+          {"vload_strided", kMove},
+          {"gather", kMove},
+          {"vbrc", kArith},
+          {"vcadd", kArith},
+          {"vcmax", kArith},
+          {"vcmin", kArith},
+  };
+  return table;
+}
+
+/*! \brief Element pairs of the verified ``vcvt`` recipes. */
+const std::unordered_map<std::string, std::unordered_set<std::string>> &
+VcvtPairs() {
+  static const std::unordered_map<std::string, std::unordered_set<std::string>>
+      table = {
+          {"float32",
+           {"int32", "int16", "float16", "bfloat16", "float8_e4m3",
+            "float8_e4m3fn", "float8_e5m2"}},
+          {"float16",
+           {"int32", "int16", "int8", "uint8", "float8_e4m3", "float8_e4m3fn",
+            "float8_e5m2", "bfloat16", "float32"}},
+          {"bfloat16",
+           {"int32", "float16", "float32", "float8_e4m3", "float8_e4m3fn",
+            "float8_e5m2"}},
+          {"int32", {"float32", "int16", "uint16", "uint8"}},
+          {"uint32", {"uint8", "int16", "uint16"}},
+          {"int16", {"float32", "float16", "int32", "uint32", "uint8"}},
+          {"uint16", {"uint32", "uint8"}},
+          {"int8", {"int16", "float16", "int32"}},
+          {"uint8", {"uint16", "float16", "uint32"}},
+          {"float8_e4m3", {"float32"}},
+          {"float8_e4m3fn", {"float32"}},
+          {"float8_e5m2", {"float32"}},
+  };
+  return table;
+}
+
 PrimExpr ZeroIdentity(const std::string &elem) {
   // float* -> FloatImm(0.0), integer -> IntImm(0); ``elem`` is a dtype string.
   const char *prefix = "float";
@@ -254,6 +347,24 @@ bool IsAtomicName(const std::string &tail) {
 
 bool IsIndexValueOp(const std::string &node_name) {
   return IndexValueOps().count(node_name) != 0;
+}
+
+bool RecipeInDtypeMatrix(const std::string &recipe) {
+  return RecipeDtypeMatrix().count(recipe) != 0;
+}
+
+bool RecipeSupportsElem(const std::string &recipe, const std::string &elem) {
+  auto it = RecipeDtypeMatrix().find(recipe);
+  if (it == RecipeDtypeMatrix().end())
+    return false;
+  return it->second.count(elem) != 0;
+}
+
+bool VcvtSupportsPair(const std::string &src, const std::string &dst) {
+  auto it = VcvtPairs().find(src);
+  if (it == VcvtPairs().end())
+    return false;
+  return it->second.count(dst) != 0;
 }
 
 bool ElemBits(const std::string &elem, int *bits) {

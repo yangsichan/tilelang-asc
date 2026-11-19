@@ -136,6 +136,28 @@ bool IsAtomicName(const std::string &tail);
 /*! \brief Whether ``node_name`` is an allowed index-vector operator. */
 bool IsIndexValueOp(const std::string &node_name);
 
+/*!
+ * \brief Whether ``recipe`` is a vector data instruction in the dtype matrix.
+ *
+ * ``false`` marks the scalar / structural recipes (``imm``, ``uniform_expr``,
+ * ``uniform_load``, ``lane_index``, predicate algebra), which have no
+ * element-dtype instruction of their own and must be skipped by the dtype
+ * validation.
+ */
+bool RecipeInDtypeMatrix(const std::string &recipe);
+/*!
+ * \brief Element dtypes a vector recipe may be emitted with.
+ *
+ * This is the recipe-level dtype support matrix: a (recipe, element) pair
+ * absent from it has no verified instruction shape on the target ISA, so P2
+ * rejects the nest instead of deferring the failure to ccec. 64-bit integer
+ * and 4-bit float elements are intentionally absent (no device evidence);
+ * ``float8_*`` only appears on load/store and ``vcvt`` recipes.
+ */
+bool RecipeSupportsElem(const std::string &recipe, const std::string &elem);
+/*! \brief Source -> destination element pairs ``vcvt`` supports. */
+bool VcvtSupportsPair(const std::string &src, const std::string &dst);
+
 /*! \brief Element bits table (``_ELEM_BITS`` in language/simd.py). */
 bool ElemBits(const std::string &elem, int *bits);
 /*! \brief Vector register lanes for an element dtype (``_vreg_lanes``). */

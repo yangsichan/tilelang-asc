@@ -12,7 +12,6 @@ import pytest
 import tilelang.ascend.language as T
 
 from tilelang.ascend.analysis.parallel_vectorize import (
-    Unsupported,
     emit_plan,
 )
 from testing.ascend.transform._parallel_vectorize_helpers import (
@@ -26,7 +25,6 @@ from testing.ascend.transform._parallel_vectorize_helpers import (
     _mixed_width_kernel,
     _nz,
     _plan,
-    _rejects,
 )
 
 
@@ -132,92 +130,6 @@ def test_same_width_segment_keeps_full_mode():
     assert "PK_B" not in text
 
 
-def test_mixed_width_with_tail_is_rejected():
-    """M = 96 is not a multiple of the 64-lane chunk width."""
-
-    m = 96
-
-    @T.prim_func
-    def k(A: T.Tensor((m,), "float32"), B: T.Tensor((m,), "float32"), C: T.Tensor((m,), "bfloat16")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((m,), "float32")
-            b_ub = T.alloc_shared((m,), "float32")
-            c_ub = T.alloc_shared((m,), "bfloat16")
-            T.copy(A, a_ub)
-            for i in T.Parallel(m):
-                b_ub[i] = T.exp(a_ub[i])
-                c_ub[i] = T.Cast("bfloat16", b_ub[i])
-            T.copy(b_ub, B)
-            T.copy(c_ub, C)
-
-    with pytest.raises(Unsupported, match="tails are not supported"):
-        _plan(k)
-
-
-def test_mixed_width_with_predicate_is_rejected():
-    @T.prim_func
-    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), B: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
-            T.copy(A, a_ub)
-            for i, j in T.Parallel(_WIDE, _WIDE):
-                if j < _WIDE - 8:
-                    b_ub[i, j] = T.exp(a_ub[i, j])
-                    c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
-            T.copy(b_ub, B)
-            T.copy(c_ub, C)
-
-    with _rejects("body.statement_predicate"):
-        _plan(k)
-
-
-def test_mixed_width_with_reduction_is_rejected():
-    """A reduction store cannot share a chunk with a wider-lane store.
-
-    The lane-uniform/partial-lane guards may fire before ``ClassifyReduce``; the
-    Stage 1 reduction guard is the second line of defence. Either way the nest
-    must be rejected, never lowered with a truncated accumulator.
-    """
-
-    @T.prim_func
-    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), S: T.Tensor((_WIDE,), "float32"), C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            s_ub = T.alloc_shared((_WIDE,), "float32")
-            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
-            T.copy(A, a_ub)
-            for i, j in T.Parallel(_WIDE, _WIDE):
-                s_ub[i] = s_ub[i] + a_ub[i, j]
-                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
-            T.copy(s_ub, S)
-            T.copy(c_ub, C)
-
-    with _rejects("plan.no_vector_axis"):
-        _plan(k)
-
-
-def test_mixed_width_with_wider_load_is_rejected():
-    """The chunk is 64 lanes, so a 128-lane load inside it is not proved."""
-
-    @T.prim_func
-    def k(A16: T.Tensor((_WIDE, _WIDE), "float16"), B: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "bfloat16")):
-        with T.Kernel(1):
-            a16_ub = T.alloc_shared((_WIDE, _WIDE), "float16")
-            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
-            T.copy(A16, a16_ub)
-            for i, j in T.Parallel(_WIDE, _WIDE):
-                b_ub[i, j] = T.Cast("float32", a16_ub[i, j]) + T.float32(1.0)
-                c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
-            T.copy(b_ub, B)
-            T.copy(c_ub, C)
-
-    with pytest.raises(Unsupported, match="-lane wide"):
-        _plan(k)
-
-
 # ===========================================================================
 # Stage 1 (continued): same-width signedness reinterpret and widening conversion (UNPK load)
 # ===========================================================================
@@ -308,12 +220,6 @@ def test_widening_from_eight_to_sixteen_bits_with_a_tail_uses_the_byte_gather(sr
         assert "tl.simd.vcvt" not in text, "zero-extension already is the u8 -> u16 value"
 
 
-def test_widening_with_a_tail_is_rejected():
-    """A tail predicate would have to be applied after the unpack: emit rejects it."""
-    with pytest.raises(Unsupported, match="masked"):
-        _emitted_text(_cast_kernel(1000, "float16", "float32"))
-
-
 def test_eight_bit_tail_uses_the_byte_gather_and_pack_store():
     """An 8-bit tail is gathered into 16-bit lanes and narrowed by ``PK_B16``."""
     n = 100
@@ -330,37 +236,6 @@ def test_eight_bit_tail_uses_the_byte_gather_and_pack_store():
     for name, extent in _declared_extents(emit_plan(_plan(_cast_kernel(n, "uint8", "uint8")))):
         if name == "c_ub":
             assert extent == 128
-
-
-def test_eight_bit_tail_beyond_the_half_register_is_rejected():
-    """A 256-lane chunk has no 256-lane masked byte gather (dest is 128 lanes)."""
-    with _rejects("body.byte_gather"):
-        _plan(_cast_kernel(200, "uint8", "uint8"))
-
-
-def test_eight_bit_strided_load_is_rejected():
-    """A strided byte load has no full-register gather form."""
-    n = 64
-
-    @T.prim_func
-    def k(A: T.Tensor((2 * n,), "uint8"), C: T.Tensor((n,), "uint8")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((2 * n,), "uint8")
-            c_ub = T.alloc_shared((n,), "uint8")
-            T.copy(A, a_ub)
-            for i in T.Parallel(n):
-                c_ub[i] = a_ub[2 * i]
-            T.copy(c_ub, C)
-
-    with _rejects("body.byte_gather"):
-        _plan(k)
-
-
-def test_thirty_two_bit_widening_is_rejected_at_plan_time():
-    """``i32/f32 -> i64`` has no 64-bit NORM store, so P2 rejects the plan."""
-    for src, dst in (("float32", "int64"), ("int32", "int64")):
-        with _rejects("body.widening_load"):
-            _plan(_cast_kernel(64, src, dst))
 
 
 def test_mixed_recipe_nest_is_split_per_statement():

@@ -367,13 +367,20 @@ bool IsFp8Elem(const std::string &elem) {
  * the emitter selects when the load register is wider than the chunk. Pairs
  * whose source is a 64-bit register (``i64->*``) and every 32-bit -> 64-bit
  * widening (``i32/f32->i64``) stay rejected: the ISA has no 64-bit ``NORM``
- * store, so the conversion has no usable consumer. They keep the Python
- * "Unsupported vcvt conversion" rejection, so the nest falls back to scalar.
+ * store, so the conversion has no usable consumer. The same pair matrix is
+ * checked by P2, so a rejected nest fails at plan time instead of reaching
+ * ccec.
  */
 PrimExpr Vcvt(const PrimExpr &src, const std::string &target_elem,
               const PrimExpr &mask, const std::string &part = "PART_EVEN") {
   std::string src_elem =
       ElemDtype(ffi::DLDataTypeToString(src.dtype()).operator std::string());
+  // The pair matrix is the single admission table; P2 validates against the
+  // same table, so an admitted plan cannot fail here.
+  if (!VcvtSupportsPair(src_elem, target_elem)) {
+    throw Unsupported("Unsupported vcvt conversion " + src_elem + "->" +
+                      target_elem);
+  }
   const std::string round = "ROUND_R";
   const std::string sat = "RS_ENABLE";
   const std::string part2 = part;

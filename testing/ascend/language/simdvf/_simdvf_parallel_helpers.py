@@ -33,8 +33,11 @@ def _compile(func, out_idx=-1):
 
     ``out_idx=None`` keeps every parameter as a caller-provided buffer, which is
     how an in-place update (and the read-back of an untouched lane) is expressed.
+    The cache is disabled so the artifact assertions always inspect this
+    compilation instead of a cached kernel from an earlier run.
     """
-    kernel = tilelang.compile(func, target="ascend", out_idx=out_idx)
+    with tilelang.testing.without_kernel_cache():
+        kernel = tilelang.compile(func, target="ascend", out_idx=out_idx)
     return kernel, kernel.get_kernel_source()
 
 

@@ -9,6 +9,8 @@ the 8-bit tail and the full ``vcvt`` pair matrix), and NZ layout / pack2
 ``vld_x2`` + ``vor`` + ``vsstb``).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -31,6 +33,36 @@ from testing.ascend.language.simdvf._simdvf_parallel_helpers import (
 @pytest.fixture(autouse=True)
 def _npu_runtime():
     _require_npu_runtime()
+
+
+F32_EPS = 2.0**-24
+
+
+def _assert_tree_sum_close(actual, values):
+    """Compare a vector sum against the exact (float64) sum with a real bound.
+
+    ``vcadd`` sums one register as a balanced tree (depth ``ceil(log2(chunk))``)
+    and the chunk results are combined with one add per chunk, so the
+    worst-case relative error with respect to ``sum(|x|)`` is ``(depth + 1) *
+    eps``. The same bound covers the source accumulator's initialization and
+    the final write-back; the reference is computed in float64 so it adds no
+    rounding of its own. The max abs / rel error and ULP are printed so a
+    regression shows the actual error magnitude.
+    """
+    actual = actual.cpu().double()
+    exact = values.double().sum(dim=1)
+    abs_sum = values.double().abs().sum(dim=1)
+    depth = math.ceil(math.log2(values.shape[1])) if values.shape[1] > 1 else 0
+    bound = (depth + 1) * F32_EPS * abs_sum
+    error = (actual - exact).abs()
+    max_abs = error.max().item()
+    max_rel = (error / exact.abs().clamp_min(torch.finfo(torch.float64).tiny)).max().item()
+    ulp = torch.pow(2.0, torch.floor(torch.log2(exact.abs().clamp_min(2.0**-126))) - 23)
+    max_ulp = (error / ulp).max().item()
+    print(f"tree sum: max_abs={max_abs:.6e} max_rel={max_rel:.6e} max_ulp={max_ulp:.2f}")
+    assert bool(torch.all(error <= bound)), (
+        f"tree-sum error {max_abs:.6e} exceeds the bound {bound.max().item():.6e} (depth={depth}, eps={F32_EPS:.3e})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +134,10 @@ def test_parallel_row_reduction_with_a_tail():
     assert "update_mask" in source, "the tail chunk reduces under a partial mask"
     assert "simd_inst::vgather2(" in source, "the tail load is a masked gather"
 
-    a = (torch.arange(rows * k, dtype=torch.int32) % 7).to(torch.float32)
-    _assert_close(kernel(a.reshape(rows, k).npu()), a.reshape(rows, k).sum(dim=1))
+    # Float sum: vcadd changes the accumulation order, so the golden is the
+    # exact float64 sum and the assertion uses the tree-reduction error bound.
+    a = torch.randn(rows, k, dtype=torch.float32)
+    _assert_tree_sum_close(kernel(a.npu()), a)
 
 
 @tilelang.testing.requires_ascend
@@ -126,9 +160,9 @@ def test_parallel_serial_shell_reduction():
     kernel, source = _compile(main)
     assert "simd_inst::vcadd(" in source, "the shell accumulator is a cross-lane reduction"
 
-    # Small integers keep the sequential and vector sums bit-identical.
-    a = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 7).to(torch.float32)
-    _assert_close(kernel(a.npu()), a.sum(dim=1))
+    # Float sum: the register tree is not the source's sequential order.
+    a = torch.randn(rows, k, dtype=torch.float32)
+    _assert_tree_sum_close(kernel(a.npu()), a)
 
 
 @tilelang.testing.requires_ascend
@@ -282,11 +316,11 @@ def test_parallel_sibling_reduction_shells_share_one_region():
     kernel, source = _compile(main, out_idx=[-2, -1])
     assert source.count("simd_inst::vcadd(") == 2, "one reduction per sibling shell"
 
-    a = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 5).to(torch.float32)
-    b = (torch.arange(rows * k, dtype=torch.int32).reshape(rows, k) % 3).to(torch.float32)
+    a = torch.randn(rows, k, dtype=torch.float32)
+    b = torch.randn(rows, k, dtype=torch.float32)
     c_npu, d_npu = kernel(a.npu(), b.npu())
-    _assert_close(c_npu, a.sum(dim=1))
-    _assert_close(d_npu, b.sum(dim=1))
+    _assert_tree_sum_close(c_npu, a)
+    _assert_tree_sum_close(d_npu, b)
 
 
 # ---------------------------------------------------------------------------
@@ -661,12 +695,12 @@ def test_parallel_elementwise_nz_and_row_reduction_are_planned_independently():
     assert "simd_inst::vcadd(" in source, "the row reduction has its own nest"
 
     a = (torch.arange(M * N, dtype=torch.int32) % 64).to(torch.float32)
-    s = (torch.arange(M * N, dtype=torch.int32) % 9).to(torch.float32)
+    s = torch.randn(M, N, dtype=torch.float32)
     c_npu, d_npu = kernel(a.reshape(M, N).npu(), s.reshape(M, N).npu())
 
     golden = (a * 2.0).to(torch.bfloat16).reshape(M, N)
     _assert_close(c_npu, _nz_physical(golden, 16))
-    _assert_close(d_npu, s.reshape(M, N).sum(dim=1))
+    _assert_tree_sum_close(d_npu, s)
 
 
 @tilelang.testing.requires_ascend

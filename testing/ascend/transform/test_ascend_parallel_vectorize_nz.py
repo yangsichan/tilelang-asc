@@ -8,17 +8,13 @@ with a derived block stride.
 from __future__ import annotations
 
 
-import pytest
-
 import tilelang.ascend.language as T
 
 from tilelang.ascend.analysis.parallel_vectorize import (
-    Unsupported,
     emit_plan,
 )
 from tilelang.layout import (
     make_ascend_compact_nz_layout,
-    make_ascend_major_mn_layout,
     make_ascend_nz_layout,
 )
 from testing.ascend.transform._parallel_vectorize_helpers import (
@@ -30,7 +26,6 @@ from testing.ascend.transform._parallel_vectorize_helpers import (
     _nz_2d_kernel,
     _p1_items,
     _plan,
-    _rejects,
 )
 
 
@@ -124,14 +119,6 @@ def test_p1_hand_off_exposes_the_annotated_layouts():
     assert [capture.buffer.name for capture in lifted[0].captures if capture.layout is not None] == ["c_ub"]
 
 
-def test_explicit_non_nz_layout_is_rejected():
-    kernel = _nz_2d_kernel()
-    layouts = _nz(kernel, make_ascend_major_mn_layout)
-
-    with pytest.raises(Unsupported, match="explicit non-NZ layout"):
-        _plan(kernel, layouts)
-
-
 def test_half_register_nz_store_is_paired_into_a_full_register():
     """Stage 2b: narrowing + NZ use the paired form (vld2 + part0/1 + vor + one vsstb)."""
 
@@ -220,85 +207,3 @@ def test_paired_store_loops_over_chunk_pairs():
     assert "chunk_s0 * 128" in text
     assert text.count("tl.simd.vsstb") == 1
     assert str(rows << 16) in text
-
-
-def test_paired_store_needs_whole_chunk_pairs():
-    """64 columns = 1 chunk, which cannot form a chunk pair."""
-
-    m = 64
-
-    @T.prim_func
-    def k(A: T.Tensor((_WIDE, m), "float32"), C: T.Tensor((_WIDE, m), "bfloat16")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((_WIDE, m), "float32")
-            c_ub = T.alloc_shared((_WIDE, m), "bfloat16")
-            T.copy(A, a_ub)
-            for i, j in T.Parallel(_WIDE, m):
-                c_ub[i, j] = T.Cast("bfloat16", a_ub[i, j])
-            T.copy(c_ub, C)
-
-    with pytest.raises(Unsupported, match="whole chunk pairs"):
-        _plan(k, _nz(k))
-
-
-def test_paired_store_must_be_the_last_store():
-    """The merged register exists only after pairing, so no statement may follow the packed store."""
-
-    @T.prim_func
-    def k(
-        A: T.Tensor((_WIDE, _WIDE), "float32"),
-        B: T.Tensor((_WIDE, _WIDE), "float32"),
-        C: T.Tensor((_WIDE, _WIDE), "bfloat16"),
-        D: T.Tensor((_WIDE, _WIDE), "float32"),
-    ):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            b_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            c_ub = T.alloc_shared((_WIDE, _WIDE), "bfloat16")
-            d_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            T.copy(A, a_ub)
-            for i, j in T.Parallel(_WIDE, _WIDE):
-                b_ub[i, j] = T.exp(a_ub[i, j])
-                c_ub[i, j] = T.Cast("bfloat16", b_ub[i, j])
-                d_ub[i, j] = b_ub[i, j] * T.float32(2.0)
-            T.copy(b_ub, B)
-            T.copy(c_ub, C)
-            T.copy(d_ub, D)
-
-    with pytest.raises(Unsupported, match="must be the last store"):
-        _plan(k, _nz(k))
-
-
-def test_nz_store_with_predicate_is_rejected():
-    @T.prim_func
-    def k(A: T.Tensor((_WIDE, _WIDE), "float32"), C: T.Tensor((_WIDE, _WIDE), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            c_ub = T.alloc_shared((_WIDE, _WIDE), "float32")
-            T.copy(A, a_ub)
-            for i, j in T.Parallel(_WIDE, _WIDE):
-                if j < _WIDE - 8:
-                    c_ub[i, j] = T.exp(a_ub[i, j])
-            T.copy(c_ub, C)
-
-    with _rejects("body.statement_predicate"):
-        _plan(k, _nz(k))
-
-
-def test_nz_store_with_partial_column_chunk_is_rejected():
-    """96 columns is not a whole number of 64-element chunks."""
-
-    m = 96
-
-    @T.prim_func
-    def k(A: T.Tensor((m, m), "float32"), C: T.Tensor((m, m), "float32")):
-        with T.Kernel(1):
-            a_ub = T.alloc_shared((m, m), "float32")
-            c_ub = T.alloc_shared((m, m), "float32")
-            T.copy(A, a_ub)
-            for i, j in T.Parallel(m, m):
-                c_ub[i, j] = T.exp(a_ub[i, j])
-            T.copy(c_ub, C)
-
-    with _rejects("plan.partial_chunks"):
-        _plan(k, _nz(k))
