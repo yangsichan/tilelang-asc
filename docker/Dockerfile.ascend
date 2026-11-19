@@ -1,0 +1,238 @@
+# Single-file TileLang v0.1.15 environment for Ascend A5/950, Linux amd64.
+# Adapted from Triton-Ascend 0ee0f56 (CANN/Python environment only).
+# Shared Python pins were validated with the Triton-Ascend 3.6.0 wheel.
+# Triton-Ascend is not preinstalled; this is not its LLVM/MLIR source-build image.
+# No local scripts, constraints files, wheel files or source checkout required.
+# Build: docker build --platform linux/amd64 -f Dockerfile.ascend -t tilelang:0.1.15-950 .
+# Build needs network access; NPU devices and host drivers are needed only at runtime.
+ARG BASE_IMAGE=ubuntu:24.04
+ARG DEVICE_TYPE=950
+
+ARG CANN_VERSION=9.2.0
+# CANN 9.2.0 ships ptoas/pypto extensions built for CPython 3.12.
+ARG PYTHON_VERSION=3.12.12
+ARG PYTHON_SERIES=3.12
+ARG BUILD_JOBS=8
+ARG PYTORCH_VERSION=2.10.0
+ARG TORCH_NPU_VERSION=2.10.0.post7
+ARG PIP_SOURCE=https://repo.huaweicloud.com/repository/pypi/simple
+
+
+# Stage 1: Install Python
+FROM ${BASE_IMAGE} AS python-installer
+
+ARG BASE_IMAGE
+ARG PYTHON_VERSION
+ARG PYTHON_SERIES
+ARG BUILD_JOBS
+ARG TARGETARCH
+
+SHELL ["/bin/bash", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/usr/local/python${PYTHON_VERSION}/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/python${PYTHON_VERSION}/lib
+
+RUN test "${TARGETARCH}" = "amd64" || { echo "This Dockerfile is validated only for linux/amd64" >&2; exit 1; }
+
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update; \
+        apt-get install --no-install-recommends -y \
+            apt-transport-https \
+            ca-certificates \
+            bash \
+            curl \
+            build-essential \
+            libssl-dev \
+            zlib1g-dev \
+            libncurses5-dev \
+            libbz2-dev \
+            libreadline-dev \
+            libsqlite3-dev \
+            libffi-dev \
+            libnss3-dev \
+            libgdbm-dev \
+            liblzma-dev \
+            libev-dev; \
+        apt-get clean; \
+        rm -rf /var/lib/apt/lists/* /var/tmp/*; \
+    else \
+        echo "Unsupported package manager in BASE_IMAGE=${BASE_IMAGE}" >&2; \
+        exit 1; \
+    fi; \
+    rm -rf /tmp/*
+
+RUN set -eux; \
+    curl -fsSL \
+        "https://repo.huaweicloud.com/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz" \
+        -o /tmp/Python-${PYTHON_VERSION}.tgz; \
+    tar -xf /tmp/Python-${PYTHON_VERSION}.tgz -C /tmp; \
+    cd /tmp/Python-${PYTHON_VERSION}; \
+    mkdir -p /usr/local/python${PYTHON_VERSION}/lib; \
+    ./configure \
+        --enable-shared \
+        --prefix=/usr/local/python${PYTHON_VERSION} \
+        LDFLAGS="-Wl,-rpath /usr/local/python${PYTHON_VERSION}/lib"; \
+    make -j"${BUILD_JOBS}"; \
+    make altinstall; \
+    ln -sf /usr/local/python${PYTHON_VERSION}/bin/python${PYTHON_SERIES} \
+        /usr/local/python${PYTHON_VERSION}/bin/python3; \
+    ln -sf /usr/local/python${PYTHON_VERSION}/bin/pip${PYTHON_SERIES} \
+        /usr/local/python${PYTHON_VERSION}/bin/pip3; \
+    ln -sf /usr/local/python${PYTHON_VERSION}/bin/python3 \
+        /usr/local/python${PYTHON_VERSION}/bin/python; \
+    ln -sf /usr/local/python${PYTHON_VERSION}/bin/pip3 \
+        /usr/local/python${PYTHON_VERSION}/bin/pip; \
+    rm -rf /tmp/*
+
+
+# Stage 2: install CANN, PyTorch and torch_npu.
+FROM python-installer AS cann-installer
+
+ARG BASE_IMAGE
+ARG CANN_VERSION
+ARG DEVICE_TYPE
+ARG PYTORCH_VERSION
+ARG TORCH_NPU_VERSION
+ARG PIP_SOURCE
+ARG TARGETARCH
+
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update; \
+        apt-get install --no-install-recommends -y \
+            git \
+            wget \
+            gcc \
+            g++ \
+            make \
+            cmake \
+            zlib1g \
+            openssl \
+            unzip \
+            pciutils \
+            net-tools \
+            libblas-dev \
+            gfortran \
+            patchelf \
+            libblas3; \
+        apt-get clean; \
+        rm -rf /var/lib/apt/lists/* /var/tmp/*; \
+    else \
+        echo "Unsupported package manager in BASE_IMAGE=${BASE_IMAGE}" >&2; \
+        exit 1; \
+    fi; \
+    rm -rf /tmp/*
+
+RUN pip install --no-cache-dir --upgrade pip --index-url "${PIP_SOURCE}"
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) ARCH="x86_64" ;; \
+        *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    case "${DEVICE_TYPE}" in \
+        950)  OPS_NAME="950" ;; \
+        *) echo "Unsupported DEVICE_TYPE=${DEVICE_TYPE}" >&2; exit 1 ;; \
+    esac; \
+    CANN_TOOLKIT_URL="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${CANN_VERSION}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${ARCH}.run"; \
+    CANN_OPS_URL="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${CANN_VERSION}/Ascend-cann-${OPS_NAME}-ops_${CANN_VERSION}_linux-${ARCH}.run"; \
+    wget --progress=dot:giga --header="Referer: https://www.hiascend.com/" \
+        "${CANN_TOOLKIT_URL}" -O /root/Ascend-cann-toolkit.run; \
+    wget --progress=dot:giga --header="Referer: https://www.hiascend.com/" \
+        "${CANN_OPS_URL}" -O /root/Ascend-cann-ops.run; \
+    chmod +x /root/Ascend-cann-toolkit.run /root/Ascend-cann-ops.run; \
+    /root/Ascend-cann-toolkit.run --quiet --install --install-for-all; \
+    /root/Ascend-cann-ops.run --quiet --install --install-for-all; \
+    rm -f /root/Ascend-cann-toolkit.run /root/Ascend-cann-ops.run
+
+RUN pip3 install --no-cache-dir \
+        pyyaml \
+        setuptools \
+        pybind11==2.13.6 \
+        psutil==6.0.0 \
+        ninja \
+        cmake \
+        wheel \
+        tabulate \
+        --index-url "${PIP_SOURCE}"
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) \
+            pip3 install --no-cache-dir "torch==${PYTORCH_VERSION}+cpu" \
+                --index-url https://mirrors.cloud.tencent.com/pytorch-wheels/whl/cpu/ ;; \
+        *) \
+            echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; \
+            exit 1 ;; \
+    esac; \
+    pip3 install --no-cache-dir "torch-npu==${TORCH_NPU_VERSION}" \
+        --index-url "${PIP_SOURCE}"
+
+# Stage 3: download the official release wheel and install pinned dependencies.
+# The cp39-abi3 filename is the official asset; its metadata requires Python >=3.10.
+ARG TILELANG_WHEEL_URL=https://github.com/tile-ai/tilelang/releases/download/v0.1.15/tilelang-0.1.15-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+ARG TILELANG_WHEEL_SHA256=e28167f071afb5e5e593b12d1c5deb9741c048ba3f140853378f1337b01dcbf0
+
+RUN set -eux; \
+    printf '%s\n' \
+        "torch==${PYTORCH_VERSION}+cpu" \
+        "torch-npu==${TORCH_NPU_VERSION}" \
+        pybind11==2.13.6 \
+        numpy==1.26.4 \
+        attrs==24.2.0 \
+        decorator==5.1.1 \
+        psutil==6.0.0 \
+        scipy==1.13.1 \
+        ml-dtypes==0.5.4 \
+        apache-tvm-ffi==0.1.12 \
+        torch-c-dlpack-ext==0.1.5 \
+        z3-solver==4.15.4.0 \
+        > /tmp/tilelang-constraints.txt; \
+    curl -fL --retry 3 --connect-timeout 30 \
+        "${TILELANG_WHEEL_URL}" -o /tmp/tilelang-0.1.15-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl; \
+    echo "${TILELANG_WHEEL_SHA256}  /tmp/tilelang-0.1.15-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" | sha256sum -c -; \
+    python3 -m pip install --no-cache-dir \
+        --constraint /tmp/tilelang-constraints.txt \
+        --index-url "${PIP_SOURCE}" \
+        /tmp/tilelang-0.1.15-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl; \
+    python3 -m pip freeze --all > /tmp/installed-constraints.txt; \
+    python3 -m pip install --no-cache-dir \
+        --constraint /tmp/tilelang-constraints.txt \
+        --constraint /tmp/installed-constraints.txt \
+        --index-url "${PIP_SOURCE}" \
+        attrs==24.2.0 decorator==5.1.1 psutil==6.0.0 scipy==1.13.1 \
+        pandas==3.0.6 plotly==7.1.0 colorlog==6.12.0 \
+        pydantic==2.13.5 loguru==0.8.0 matplotlib==3.11.2 msguard==0.0.8 \
+        opentelemetry-exporter-otlp-proto-grpc==1.45.2 \
+        opentelemetry-exporter-otlp-proto-http==1.45.2 \
+        absl-py==2.5.1; \
+    rm -f /tmp/installed-constraints.txt; \
+    rm -f /tmp/tilelang-0.1.15-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl /tmp/tilelang-constraints.txt
+
+# Generate the entrypoint inside the image; no host-side shell script needed.
+RUN set -eux; \
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'set -e' \
+        'for f in /usr/local/Ascend/cann/set_env.sh /usr/local/Ascend/ascend-toolkit/set_env.sh; do' \
+        '    if [ -f "$f" ]; then source "$f"; exec "$@"; fi' \
+        'done' \
+        'echo "CANN environment script not found" >&2' \
+        'exit 1' \
+        > /usr/local/bin/tilelang-entrypoint; \
+    chmod +x /usr/local/bin/tilelang-entrypoint
+
+ENV TILELANG_DEFAULT_TARGET=ascend
+ENV ASCEND_NPU_ARCH=dav-3510
+
+# Check CANN-visible dependencies and PTO imports without NPU hardware.
+# Hardware correctness is checked separately.
+RUN /usr/local/bin/tilelang-entrypoint python3 -m pip check
+RUN /usr/local/bin/tilelang-entrypoint python3 -c \
+    'import torch; import torch_npu; import tilelang; import ptoas; import pypto; assert tilelang.__version__ == "0.1.15"; print("TileLang", tilelang.__version__, "Torch", torch.__version__, "Torch-NPU", torch_npu.__version__, "PyPTO", pypto.__version__)'
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/tilelang-entrypoint"]
+CMD ["bash"]
