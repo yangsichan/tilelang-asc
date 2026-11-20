@@ -52,7 +52,7 @@ public:
 
   // Convert to CU_TENSOR_MAP_SWIZZLE_* values.
   int CanonicalOrdinal() const {
-    return static_cast<int>(operator->()->_value);
+    return static_cast<int>(operator->()->_int_index);
   }
 
   // The byte-space Sw<b,4,3> width: none->0, 32B->1, 64B->2, 128B->3.
@@ -91,7 +91,7 @@ public:
 
 private:
   static SwizzleMode Get(const ffi::String &name) {
-    ffi::Enum e = ffi::EnumObj::Get<SwizzleModeObj>(name);
+    ffi::Enum e = ffi::EnumObj::_GetByStrIndex<SwizzleModeObj>(name);
     const auto *node = e.as<SwizzleModeObj>();
     ICHECK(node != nullptr)
         << "SwizzleMode entry `" << name << "` is not a SwizzleModeObj";

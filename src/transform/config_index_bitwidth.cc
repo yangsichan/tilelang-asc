@@ -1,9 +1,9 @@
-#include "../../3rdparty/tvm/src/tirx/ir/data_type_rewriter.h"
 #include "../op/builtin.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/int64_promoter.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
+#include "tirx/ir/data_type_rewriter.h"
 #include <tvm/ir/cast.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>

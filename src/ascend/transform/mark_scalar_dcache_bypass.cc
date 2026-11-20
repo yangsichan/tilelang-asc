@@ -14,8 +14,8 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
-#include "../../../3rdparty/tvm/src/tirx/transform/ir_utils.h"
 #include "ascend/op/builtin.h"
+#include "tirx/transform/ir_utils.h"
 
 namespace tvm {
 namespace tl {

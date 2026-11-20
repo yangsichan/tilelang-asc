@@ -1,0 +1,405 @@
+diff --git a/include/tvm/ir/repr.h b/include/tvm/ir/repr.h
+index de2f6252214308e838183a83db70c5127dc6e85b..cf542f0c530d52ad7f434e54aa7259d9e8db8101 100644
+--- a/include/tvm/ir/repr.h
++++ b/include/tvm/ir/repr.h
+@@ -18,11 +18,7 @@
+  */
+ /*!
+  * \file tvm/ir/repr.h
+- * \brief ostream operator<< for ffi::ObjectRef, Any, and Variant, delegating to
+- *        ffi::ReprPrint.  Also re-exports the Dump() debug helpers.
+- *
+- * Include this header wherever you need `os << some_objectref` and you are
+- * no longer pulling in the legacy repr_printer.h.
++ * \brief Re-export the FFI repr operators and declare the Dump() debug helpers.
+  */
+ #ifndef TVM_IR_REPR_H_
+ #define TVM_IR_REPR_H_
+@@ -48,25 +44,4 @@ TVM_DLL void Dump(const ffi::Object* node);
+
+ }  // namespace tvm
+
+-namespace tvm {
+-namespace ffi {
+-
+-// ostream << ObjectRef  — delegates to ffi::ReprPrint
+-inline std::ostream& operator<<(std::ostream& os, const ObjectRef& n) {  // NOLINT(*)
+-  return os << ffi::ReprPrint(Any(n));
+-}
+-
+-// ostream << Any — delegates to ffi::ReprPrint
+-inline std::ostream& operator<<(std::ostream& os, const Any& n) {  // NOLINT(*)
+-  return os << ffi::ReprPrint(n);
+-}
+-
+-// ostream << Variant<...> — delegates to ffi::ReprPrint
+-template <typename... V>
+-inline std::ostream& operator<<(std::ostream& os, const ffi::Variant<V...>& n) {  // NOLINT(*)
+-  return os << ffi::ReprPrint(Any(n));
+-}
+-
+-}  // namespace ffi
+-}  // namespace tvm
+ #endif  // TVM_IR_REPR_H_
+diff --git a/include/tvm/relax/expr.h b/include/tvm/relax/expr.h
+index 667150df7adbcddb6106306db11eac485db65d92..a36a7b7a4aca87789125969889c997804267af25 100644
+--- a/include/tvm/relax/expr.h
++++ b/include/tvm/relax/expr.h
+@@ -574,7 +574,7 @@ class BindingNode : public ffi::Object {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<BindingNode>()
+         .def_ro("span", &BindingNode::span, refl::AttachFieldFlag::SEqHashIgnore())
+-        .def_ro("var", &BindingNode::var, refl::AttachFieldFlag::SEqHashDef());
++        .def_ro("var", &BindingNode::var, refl::AttachFieldFlag::SEqHashDefPattern());
+   }
+
+   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+@@ -616,7 +616,7 @@ class MatchCastNode : public BindingNode {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<MatchCastNode>()
+         .def_ro("value", &MatchCastNode::value)
+-        .def_ro("struct_info", &MatchCastNode::struct_info, refl::AttachFieldFlag::SEqHashDef());
++        .def_ro("struct_info", &MatchCastNode::struct_info, refl::AttachFieldFlag::SEqHashDefPattern());
+   }
+   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("relax.expr.MatchCast", MatchCastNode, BindingNode);
+ };
+@@ -822,7 +822,7 @@ class FunctionNode : public BaseFuncNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<FunctionNode>()
+-        .def_ro("params", &FunctionNode::params, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("params", &FunctionNode::params, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("body", &FunctionNode::body)
+         .def_ro("ret_struct_info", &FunctionNode::ret_struct_info)
+         .def_ro("is_pure", &FunctionNode::is_pure);
+diff --git a/include/tvm/relax/struct_info.h b/include/tvm/relax/struct_info.h
+index de7650e1662c0d284b0c6df3ec123626beca03c7..0802c57e64686f744e8859c3a71b74babae45452 100644
+--- a/include/tvm/relax/struct_info.h
++++ b/include/tvm/relax/struct_info.h
+@@ -294,7 +294,7 @@ class FuncStructInfoNode : public StructInfoNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<FuncStructInfoNode>()
+-        .def_ro("params", &FuncStructInfoNode::params, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("params", &FuncStructInfoNode::params, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("ret", &FuncStructInfoNode::ret)
+         .def_ro("derive_func", &FuncStructInfoNode::derive_func)
+         .def_ro("purity", &FuncStructInfoNode::purity);
+diff --git a/include/tvm/script/printer/ir_docsifier.h b/include/tvm/script/printer/ir_docsifier.h
+index e49d4f8a1cc04874ba285c1fe2d997c02c56904a..b32f9fa4b786540dd4765801fe27db44f50a734d 100644
+--- a/include/tvm/script/printer/ir_docsifier.h
++++ b/include/tvm/script/printer/ir_docsifier.h
+@@ -19,6 +19,7 @@
+ #ifndef TVM_SCRIPT_PRINTER_IR_DOCSIFIER_H_
+ #define TVM_SCRIPT_PRINTER_IR_DOCSIFIER_H_
+
++#include <tvm/ffi/device.h>
+ #include <tvm/ffi/reflection/access_path.h>
+ #include <tvm/ffi/reflection/registry.h>
+ #include <tvm/ir/cast.h>
+diff --git a/include/tvm/tirx/buffer.h b/include/tvm/tirx/buffer.h
+index 72640a80df31cd9b029856946c81ba978115346c..fb99ebaa58e5e8b23e4b7c4b7103462fc2caf5d6 100644
+--- a/include/tvm/tirx/buffer.h
++++ b/include/tvm/tirx/buffer.h
+@@ -116,13 +116,13 @@ class BufferNode : public ffi::Object {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<BufferNode>()
+-        .def_ro("data", &BufferNode::data, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("data", &BufferNode::data, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("dtype", &BufferNode::dtype)
+-        .def_ro("shape", &BufferNode::shape, refl::AttachFieldFlag::SEqHashDef())
+-        .def_ro("strides", &BufferNode::strides, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("shape", &BufferNode::shape, refl::AttachFieldFlag::SEqHashDefPattern())
++        .def_ro("strides", &BufferNode::strides, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("axis_separators", &BufferNode::axis_separators,
+-                refl::AttachFieldFlag::SEqHashDef())
+-        .def_ro("elem_offset", &BufferNode::elem_offset, refl::AttachFieldFlag::SEqHashDef())
++                refl::AttachFieldFlag::SEqHashDefPattern())
++        .def_ro("elem_offset", &BufferNode::elem_offset, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("name", &BufferNode::name, refl::AttachFieldFlag::SEqHashIgnore())
+         .def_ro("data_alignment", &BufferNode::data_alignment)
+         .def_ro("offset_factor", &BufferNode::offset_factor)
+diff --git a/include/tvm/tirx/expr.h b/include/tvm/tirx/expr.h
+index a4d0d465a452759a4661398b300ff059762f5e41..517a648681d52c1c1f0f0242297aa80cbed18718 100644
+--- a/include/tvm/tirx/expr.h
++++ b/include/tvm/tirx/expr.h
+@@ -708,7 +708,7 @@ class LetNode : public PrimExprNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<LetNode>()
+-        .def_ro("var", &LetNode::var, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("var", &LetNode::var, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("value", &LetNode::value)
+         .def_ro("body", &LetNode::body);
+   }
+@@ -841,8 +841,8 @@ class CommReducerNode : public ffi::Object {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<CommReducerNode>()
+-        .def_ro("lhs", &CommReducerNode::lhs, refl::AttachFieldFlag::SEqHashDef())
+-        .def_ro("rhs", &CommReducerNode::rhs, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("lhs", &CommReducerNode::lhs, refl::AttachFieldFlag::SEqHashDefPattern())
++        .def_ro("rhs", &CommReducerNode::rhs, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("result", &CommReducerNode::result)
+         .def_ro("identity_element", &CommReducerNode::identity_element)
+         .def_ro("span", &CommReducerNode::span, refl::AttachFieldFlag::SEqHashIgnore());
+diff --git a/include/tvm/tirx/function.h b/include/tvm/tirx/function.h
+index aec5f304541856c1b5012eaf84e256146ea3520b..da7659065e5580ca5baf990244b49923e6594da2 100644
+--- a/include/tvm/tirx/function.h
++++ b/include/tvm/tirx/function.h
+@@ -105,7 +105,7 @@ class PrimFuncNode : public BaseFuncNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<PrimFuncNode>()
+-        .def_ro("params", &PrimFuncNode::params, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("params", &PrimFuncNode::params, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("ret_type", &PrimFuncNode::ret_type)
+         .def_ro("buffer_map", &PrimFuncNode::buffer_map)
+         .def_ro("body", &PrimFuncNode::body);
+diff --git a/include/tvm/tirx/index_map.h b/include/tvm/tirx/index_map.h
+index 05dea246c35ac11a6e9b326a7131fc5c550beeb1..baeedc880ba84f4023082f43681e1bba0ea1577b 100644
+--- a/include/tvm/tirx/index_map.h
++++ b/include/tvm/tirx/index_map.h
+@@ -156,7 +156,7 @@ class IndexMapNode : public ffi::Object {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<IndexMapNode>()
+         .def_ro("initial_indices", &IndexMapNode::initial_indices,
+-                refl::AttachFieldFlag::SEqHashDef())
++                refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("final_indices", &IndexMapNode::final_indices)
+         .def_ro("inverse_index_map", &IndexMapNode::inverse_index_map,
+                 refl::AttachFieldFlag::SEqHashIgnore());
+diff --git a/include/tvm/tirx/stmt.h b/include/tvm/tirx/stmt.h
+index 0954f9d57b7e158b54232e4330c3099dcf13ba41..337729464819e9e25af09eefe9385dc7b1a7d396 100644
+--- a/include/tvm/tirx/stmt.h
++++ b/include/tvm/tirx/stmt.h
+@@ -88,7 +88,7 @@ class BindNode : public StmtNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<BindNode>()
+-        .def_ro("var", &BindNode::var, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("var", &BindNode::var, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("value", &BindNode::value);
+   }
+   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tirx.Bind", BindNode, StmtNode);
+@@ -275,7 +275,7 @@ class AllocBufferNode : public StmtNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<AllocBufferNode>()
+-        .def_ro("buffer", &AllocBufferNode::buffer, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("buffer", &AllocBufferNode::buffer, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("annotations", &AllocBufferNode::annotations);
+   }
+   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tirx.AllocBuffer", AllocBufferNode, StmtNode);
+@@ -621,7 +621,7 @@ class ForNode : public StmtNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<ForNode>()
+-        .def_ro("loop_var", &ForNode::loop_var, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("loop_var", &ForNode::loop_var, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("min", &ForNode::min)
+         .def_ro("extent", &ForNode::extent)
+         .def_ro("kind", &ForNode::kind)
+@@ -831,7 +831,7 @@ class SBlockNode : public StmtNode {
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<SBlockNode>()
+-        .def_ro("iter_vars", &SBlockNode::iter_vars, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("iter_vars", &SBlockNode::iter_vars, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("reads", &SBlockNode::reads)
+         .def_ro("writes", &SBlockNode::writes)
+         .def_ro("name_hint", &SBlockNode::name_hint, refl::AttachFieldFlag::SEqHashIgnore())
+diff --git a/include/tvm/tirx/var.h b/include/tvm/tirx/var.h
+index c38908d56d7dfbd8edb71d2a13b6878ed7b48cff..2fbc12d7ad2303eddeefe25eeffa04950215c99d 100644
+--- a/include/tvm/tirx/var.h
++++ b/include/tvm/tirx/var.h
+@@ -279,7 +279,7 @@ class IterVarNode : public PrimExprConvertibleNode {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<IterVarNode>()
+         .def_ro("dom", &IterVarNode::dom)
+-        .def_ro("var", &IterVarNode::var, refl::AttachFieldFlag::SEqHashDef())
++        .def_ro("var", &IterVarNode::var, refl::AttachFieldFlag::SEqHashDefPattern())
+         .def_ro("iter_type", &IterVarNode::iter_type)
+         .def_ro("thread_tag", &IterVarNode::thread_tag);
+   }
+diff --git a/python/tvm/ir/json_compact.py b/python/tvm/ir/json_compact.py
+index 848de6b54dc2a836eb4669983fb9d009a1af212e..e9a1a6029038e0ce117651880c751fca9aef3825 100644
+--- a/python/tvm/ir/json_compact.py
++++ b/python/tvm/ir/json_compact.py
+@@ -84,4 +84,21 @@ def upgrade_json(json_str):
+     data = json.loads(json_str)
+     if "metadata" not in data and "attrs" in data:
+         raise ValueError("Legacy json graph format detected, we don't support it anymore.")
++
++    # Older TileLang enums stored the name as a reference to an ffi.String node.
++    # TVM FFI 0.1.14 resolves the registered singleton from the name directly.
++    nodes = data.get("nodes", [])
++    for node in nodes:
++        if node.get("type") not in ("tl.SwizzleMode", "tl.WSSyncKind"):
++            continue
++        fields = node.get("data")
++        if isinstance(fields, dict) and "_name" in fields:
++            name_index = fields["_name"]
++            if type(name_index) is not int or not 0 <= name_index < len(nodes):
++                raise ValueError("Invalid enum name reference in the JSON graph.")
++            name_node = nodes[name_index]
++            if name_node.get("type") != "ffi.String" or not isinstance(name_node.get("data"), str):
++                raise ValueError("Invalid enum name in the JSON graph.")
++            node["data"] = name_node["data"]
++
+     return json.dumps(data, indent=2)
+diff --git a/python/tvm/runtime/_tensor.py b/python/tvm/runtime/_tensor.py
+index 1f4da868bb89a5595c1c9d1c8d622779531edafb..d36014288d0008b801d79b0d1ab98b9da4773606 100644
+--- a/python/tvm/runtime/_tensor.py
++++ b/python/tvm/runtime/_tensor.py
+@@ -75,6 +75,9 @@ class Tensor(tvm_ffi.core.Tensor):
+     how can we use TVM in existing project which might have their own array containers.
+     """
+
++    # The FFI registry already owns Tensor wrappers of the base class size.
++    __slots__ = ()
++
+     def __setitem__(self, in_slice, value):
+         """Set ndarray value"""
+         if (
+diff --git a/python/tvm/runtime/device.py b/python/tvm/runtime/device.py
+index 7439751c7d6baa88a6225ef5ccfd5f8f4d0df1b5..5cf76f7421df21d355e9a88007ec3eeb8bf13e0c 100644
+--- a/python/tvm/runtime/device.py
++++ b/python/tvm/runtime/device.py
+@@ -27,7 +27,17 @@ RPC_SESS_MASK = 128
+
+
+ class Device(tvm_ffi.core.Device):
+-    """TVM device strucure."""
++    """TVM device structure."""
++
++    # FFI accepts DLPack device names. Keep TVM's target-name aliases here.
++    _DEVICE_NAME_TO_TYPE = {
++        **tvm_ffi.core.Device._DEVICE_NAME_TO_TYPE,
++        "llvm": tvm_ffi.DLDeviceType.kDLCPU,
++        "c": tvm_ffi.DLDeviceType.kDLCPU,
++        "test": tvm_ffi.DLDeviceType.kDLCPU,
++        "nvptx": tvm_ffi.DLDeviceType.kDLCUDA,
++        "cl": tvm_ffi.DLDeviceType.kDLOpenCL,
++    }
+
+     def _GetDeviceAttr(self, device_type, device_id, attr_id):
+         """Internal helper function to invoke runtime.GetDeviceAttr"""
+diff --git a/src/relax/op/tensor/create.cc b/src/relax/op/tensor/create.cc
+index cfd8b0ab38d7093e812f66d2f2c2824677784946..a21224c3413824b4249fed5a89f111bf19422ce5 100644
+--- a/src/relax/op/tensor/create.cc
++++ b/src/relax/op/tensor/create.cc
+@@ -49,8 +49,8 @@ Expr full(ffi::Variant<Expr, ffi::Array<PrimExpr>> shape, Expr fill_value,
+   Expr shape_in_expr{nullptr};
+   if (const auto* expr = shape.as<ExprNode>()) {
+     shape_in_expr = ffi::GetRef<Expr>(expr);
+-  } else if (const auto* _array = shape.as<ffi::ArrayObj>()) {
+-    shape_in_expr = ShapeExpr(ffi::GetRef<ffi::Array<PrimExpr>>(_array));
++  } else if (auto array = shape.as<ffi::Array<PrimExpr>>()) {
++    shape_in_expr = ShapeExpr(*array);
+   } else {
+     TVM_FFI_THROW(InternalError)
+         << "Full only expects the input shape to be either an Expr or an Array of PrimExpr. ";
+diff --git a/src/relax/op/tensor/manipulate.cc b/src/relax/op/tensor/manipulate.cc
+index c0b82a760d1310da3ef79d0a2305ace80f78c4c8..4c860dba1c124980249807bb2aa36bc7974b3e05 100644
+--- a/src/relax/op/tensor/manipulate.cc
++++ b/src/relax/op/tensor/manipulate.cc
+@@ -947,7 +947,8 @@ Expr ConvertNewShapeToExpr(const Expr& data,
+     }
+   }
+
+-  ffi::Array<PrimExpr> array_ref = ffi::GetRef<ffi::Array<PrimExpr>>(array);
++  ffi::Array<PrimExpr> array_ref =
++      ffi::GetRef<ffi::ObjectRef>(array).as_or_throw<ffi::Array<PrimExpr>>();
+   // When there is no dimension to infer, just return the input array as ShapeExpr.
+   if (dim_to_infer == -1 && zero_dims.empty()) {
+     return ShapeExpr(array_ref);
+@@ -1075,7 +1076,8 @@ Expr split(Expr x, ffi::Variant<IntImm, ffi::Array<IntImm>> indices_or_sections,
+              "However, the given indices "
+           << indices_or_sections << " contains some non-integer.";
+     }
+-    indices_or_sections_obj = ConvertIntImmToInt64(ffi::GetRef<ffi::Array<IntImm>>(indices));
++    indices_or_sections_obj = ConvertIntImmToInt64(
++        ffi::GetRef<ffi::ObjectRef>(indices).as_or_throw<ffi::Array<IntImm>>());
+   } else if (const auto* n_section = indices_or_sections.as<IntImmNode>()) {
+     TVM_FFI_ICHECK_GT(n_section->value, 0)
+         << "Split op expects the input number of sections to be a "
+diff --git a/src/runtime/contrib/sort/sort.cc b/src/runtime/contrib/sort/sort.cc
+index 0d072c9638460a35efdc20887d05cb02c7aa737b..4e370584faccd4421ae44940309d71a8cd5fa739 100644
+--- a/src/runtime/contrib/sort/sort.cc
++++ b/src/runtime/contrib/sort/sort.cc
+@@ -22,6 +22,7 @@
+  */
+
+ #include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
+ #include <tvm/ffi/error.h>
+ #include <tvm/ffi/function.h>
+ #include <tvm/ffi/reflection/registry.h>
+diff --git a/src/s_tir/meta_schedule/mutator/mutate_tile_size.cc b/src/s_tir/meta_schedule/mutator/mutate_tile_size.cc
+index dce906501b4484d8ca2d08eeabb36d4152b730e3..6da91ae6fbb1d281bd594af9d902a18e080a4ad7 100644
+--- a/src/s_tir/meta_schedule/mutator/mutate_tile_size.cc
++++ b/src/s_tir/meta_schedule/mutator/mutate_tile_size.cc
+@@ -39,8 +39,8 @@ using s_tir::Trace;
+  * \return The result of downcast
+  */
+ std::vector<int64_t> DowncastTilingDecision(const ffi::ObjectRef& decision) {
+-  const auto* arr = TVM_TYPE_AS(decision, ffi::ArrayObj);
+-  return support::AsVector<ffi::ObjectRef, int64_t>(ffi::GetRef<ffi::Array<ffi::ObjectRef>>(arr));
++  return support::AsVector<ffi::ObjectRef, int64_t>(
++      decision.as_or_throw<ffi::Array<ffi::ObjectRef>>());
+ }
+
+ /*!
+diff --git a/src/s_tir/schedule/trace.cc b/src/s_tir/schedule/trace.cc
+index 5f2c4269e71bbe2f73e3c94e9fdba6f2fabf9622..1618d538c609cbff6c01a1777832aae1b3c14e4a 100644
+--- a/src/s_tir/schedule/trace.cc
++++ b/src/s_tir/schedule/trace.cc
+@@ -398,11 +398,8 @@ void Trace::ApplyJSONToSchedule(ffi::ObjectRef json, Schedule sch) {
+   try {
+     const ffi::ArrayObj* arr = json.as<ffi::ArrayObj>();
+     TVM_FFI_ICHECK(arr && arr->size() == 2);
+-    const auto* arr0 = arr->at(0).as<ffi::ArrayObj>();
+-    const auto* arr1 = arr->at(1).as<ffi::ArrayObj>();
+-    TVM_FFI_ICHECK(arr0 && arr1);
+-    json_insts = ffi::GetRef<ffi::Array<Any>>(arr0);
+-    json_decisions = ffi::GetRef<ffi::Array<Any>>(arr1);
++    json_insts = arr->at(0).cast<ffi::Array<Any>>();
++    json_decisions = arr->at(1).cast<ffi::Array<Any>>();
+   } catch (const tvm::ffi::Error& e) {
+     TVM_FFI_THROW(ValueError) << "The json entry of a trace should contain two arrays, an array of "
+                                  "instructions and an array of decisions, but gets: "
+diff --git a/src/target/virtual_device.cc b/src/target/virtual_device.cc
+index c7357d7f14f7aa2721336972bc959f45195d9f68..58e78f351a44daa94344b9063ea3e3b8fb4d6d60 100644
+--- a/src/target/virtual_device.cc
++++ b/src/target/virtual_device.cc
+@@ -22,6 +22,7 @@
+  * \brief A compile time representation for where data is to be stored at runtime, and how to
+  * compile code to compute it.
+  */
++#include <tvm/ffi/device.h>
+ #include <tvm/ffi/reflection/registry.h>
+ #include <tvm/runtime/device_api.h>
+ #include <tvm/target/virtual_device.h>
+diff --git a/cmake/modules/Git.cmake b/cmake/modules/Git.cmake
+--- a/cmake/modules/Git.cmake
++++ b/cmake/modules/Git.cmake
+@@ -24,7 +24,7 @@
+ if (${GIT_FOUND})
+   message(STATUS "Git found: ${GIT_EXECUTABLE}")
+   execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+-                  WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
++                  WORKING_DIRECTORY "${TILELANG_TVM_UPSTREAM}"
+                   OUTPUT_VARIABLE TVM_GIT_COMMIT_HASH
+                   RESULT_VARIABLE _TVM_GIT_RESULT
+                   ERROR_VARIABLE _TVM_GIT_ERROR
+@@ -38,7 +38,7 @@
+   endif()
+
+   execute_process(COMMAND ${GIT_EXECUTABLE} show -s --format=%ci HEAD
+-                  WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
++                  WORKING_DIRECTORY "${TILELANG_TVM_UPSTREAM}"
+                   OUTPUT_VARIABLE TVM_GIT_COMMIT_TIME
+                   RESULT_VARIABLE _TVM_GIT_RESULT
+                   ERROR_VARIABLE _TVM_GIT_ERROR

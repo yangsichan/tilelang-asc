@@ -4,3 +4,6 @@
 [submodule "3rdparty/tvm"]
 	path = 3rdparty/tvm
 	url = https://github.com/TileLang/tvm
+[submodule "3rdparty/tvm-ffi"]
+	path = 3rdparty/tvm-ffi
+	url = https://github.com/apache/tvm-ffi

@@ -438,6 +438,9 @@ option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel r
 
 # Include tvm after configs have been populated
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
+install(DIRECTORY "${TVM_SOURCE}/src" "${TVM_SOURCE}/include" "${TVM_SOURCE}/python"
+        DESTINATION tilelang/3rdparty/tvm PATTERN "__pycache__" EXCLUDE)
+install(FILES "${TVM_SOURCE}/version.py" DESTINATION tilelang/3rdparty/tvm)
 
 # Strip the hardcoded /Zi PRIVATE option that tvm-ffi attaches in its
 # tvm_ffi_add_msvc_flags() helper. It overrides our Embedded debug info
