@@ -90,6 +90,8 @@ Then, clone the tilelang repository and install it using pip. The `-v` flag enab
 
 > **Note**: Use the `--recursive` flag to include necessary submodules. Tilelang currently depends on a customized version of TVM, which is included as a submodule. If you prefer [Building with Existing TVM Installation](#using-existing-tvm), you can skip cloning the TVM submodule (but still need other dependencies).
 
+CMake applies the TVM compatibility patch in the build directory and uses the pinned Apache TVM FFI 0.1.14.post0 sources. The same patched Python modules and headers are included in the wheel.
+
 ### With host CUDA toolchain
 
 ```bash
@@ -314,7 +316,7 @@ pip install -e . -v --no-build-isolation --no-deps
 
 # Manually install required runtime deps when using --no-deps.
 # Note: skip torch-c-dlpack-ext on ROCm (its wheel expects CUDA libs).
-pip install "apache-tvm-ffi>=0.1.11,<0.1.13" "z3-solver>=4.13.0"
+pip install "apache-tvm-ffi==0.1.14.post0" "z3-solver>=4.13.0"
 # If you already installed torch-c-dlpack-ext and hit `libtorch_cuda.so` errors:
 # pip uninstall -y torch-c-dlpack-ext
 

@@ -164,7 +164,7 @@ public:
   static WSSyncKind ConsumerRelease() { return Get("CONSUMER_RELEASE"); }
 
   int CanonicalOrdinal() const {
-    return static_cast<int>(operator->()->_value);
+    return static_cast<int>(operator->()->_int_index);
   }
 
   bool IsProducerAcquire() const { return CanonicalOrdinal() == 0; }
@@ -180,7 +180,7 @@ public:
 
 private:
   static WSSyncKind Get(const ffi::String &name) {
-    ffi::Enum e = ffi::EnumObj::Get<WSSyncKindObj>(name);
+    ffi::Enum e = ffi::EnumObj::_GetByStrIndex<WSSyncKindObj>(name);
     const auto *node = e.as<WSSyncKindObj>();
     ICHECK(node != nullptr)
         << "WSSyncKind entry `" << name << "` is not a WSSyncKindObj";

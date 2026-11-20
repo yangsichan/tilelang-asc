@@ -9,7 +9,7 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 
-#include "../../../3rdparty/tvm/src/tirx/ir/data_type_rewriter.h"
+#include "tirx/ir/data_type_rewriter.h"
 
 namespace tvm {
 namespace tl {

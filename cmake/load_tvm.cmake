@@ -10,7 +10,11 @@ if(DEFINED ENV{TVM_ROOT})
   endif()
 endif()
 
-message(STATUS "Using TVM source: ${TVM_SOURCE}")
+include("${CMAKE_CURRENT_LIST_DIR}/prepare_tvm.cmake")
+set(TILELANG_TVM_UPSTREAM "${TVM_SOURCE}")
+set(TVM_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/tvm-source")
+tilelang_prepare_tvm("${TILELANG_TVM_UPSTREAM}" "${TVM_SOURCE}")
+message(STATUS "Using patched TVM source: ${TVM_SOURCE}")
 
 set(TVM_INCLUDES
   ${TVM_SOURCE}/include

@@ -49,6 +49,7 @@ repos:
         exclude: |
           (?x)(
             ^.+\.(cpp|hpp|cxx|cc|c|h|cu|cuh)$|
+            ^cmake/patches/.*\.patch$|
             ^.+\.svg$|
             ^.*\brequirements\b.*\.txt$
           )
