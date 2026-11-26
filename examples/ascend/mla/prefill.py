@@ -32,6 +32,7 @@ KV_WORKSPACE_SLOTS = 3
 # explicit caller contract, not a property inferred only by the test harness.
 BENCHMARK_AUTO_FULL_VALID_KV = False
 
+
 def _check_tensor(name, value, shape, dtype, device):
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
@@ -87,8 +88,7 @@ def _packed_kv_workspace(width, full_length, pipeline_queries, full_valid_kv):
 
 
 def _use_direct_kv_l1(width, full_length, pipeline_queries, full_valid_kv, pair_dma, kv_split):
-    return (full_length and pipeline_queries and width % KV_TILE_ROWS == 0
-            and not full_valid_kv and not pair_dma and kv_split == 1)
+    return full_length and pipeline_queries and width % KV_TILE_ROWS == 0 and not full_valid_kv and not pair_dma and kv_split == 1
 
 
 def _balance_streaming_ranges(lengths, tile_counts, tile_prefix, ranges):
@@ -112,9 +112,11 @@ def _balance_streaming_ranges(lengths, tile_counts, tile_prefix, ranges):
     peak_queries = max(count for _, count in ranges)
 
     def suffix_start(end, tile_cap, kv_cap):
-        return max(end - peak_queries,
-                   bisect_left(tile_prefix, tile_prefix[end] - tile_cap, hi=end),
-                   bisect_left(kv_prefix, kv_prefix[end] - kv_cap, hi=end))
+        return max(
+            end - peak_queries,
+            bisect_left(tile_prefix, tile_prefix[end] - tile_cap, hi=end),
+            bisect_left(kv_prefix, kv_prefix[end] - kv_cap, hi=end),
+        )
 
     def fits(tile_cap, kv_cap):
         # Each core takes the longest fitting suffix of the remaining queries.
@@ -128,11 +130,9 @@ def _balance_streaming_ranges(lengths, tile_counts, tile_prefix, ranges):
 
     # The original partition gives feasible upper bounds for both searches.
     tile_floor = max(max(tile_counts), (tile_prefix[-1] + grid - 1) // grid)
-    tile_cap = tile_floor + bisect_left(
-        range(tile_floor, peak_tiles), True, key=lambda cap: fits(cap, peak_kv))
+    tile_cap = tile_floor + bisect_left(range(tile_floor, peak_tiles), True, key=lambda cap: fits(cap, peak_kv))
     kv_floor = max(max(kv_groups), (kv_prefix[-1] + grid - 1) // grid)
-    kv_cap = kv_floor + bisect_left(
-        range(kv_floor, peak_kv), True, key=lambda cap: fits(tile_cap, cap))
+    kv_cap = kv_floor + bisect_left(range(kv_floor, peak_kv), True, key=lambda cap: fits(tile_cap, cap))
     if tile_cap == peak_tiles and kv_cap == peak_kv:
         return ranges
 
@@ -146,9 +146,12 @@ def _balance_streaming_ranges(lengths, tile_counts, tile_prefix, ranges):
     for core, (old_start, old_count) in enumerate(ranges[:-1]):
         remaining = grid - core - 1
         low = max(start + 1, earliest[remaining])
-        high = min(rows - remaining, start + peak_queries,
-                   bisect_right(tile_prefix, tile_prefix[start] + tile_cap) - 1,
-                   bisect_right(kv_prefix, kv_prefix[start] + kv_cap) - 1)
+        high = min(
+            rows - remaining,
+            start + peak_queries,
+            bisect_right(tile_prefix, tile_prefix[start] + tile_cap) - 1,
+            bisect_right(kv_prefix, kv_prefix[start] + kv_cap) - 1,
+        )
         end = min(max(old_start + old_count, low), high)
         balanced.append((start, end - start))
         start = end
@@ -168,8 +171,7 @@ def _cost_meta(host_lengths, rows, grid, full_lengths, width, *, task_pipeline=F
     """
     if full_lengths:
         per, extra = divmod(rows, grid)
-        ranges = [(core * per + min(core, extra), per + (core < extra))
-                  for core in range(grid)]
+        ranges = [(core * per + min(core, extra), per + (core < extra)) for core in range(grid)]
         return torch.tensor(ranges, dtype=torch.int32)
     if host_lengths is None:
         # No host-visible lengths and not known full: the per-query fallback
@@ -202,14 +204,13 @@ def _cost_meta(host_lengths, rows, grid, full_lengths, width, *, task_pipeline=F
             tiles = tile_counts[i]
             for tile in range(tiles):
                 valid = min(128, max(0, lengths[i] - tile * 128))
-                tasks.append((i, tile, valid, int(tile == 0),
-                              int(tile + 1 == tiles), (2 * i) % 3))
+                tasks.append((i, tile, valid, int(tile == 0), int(tile + 1 == tiles), (2 * i) % 3))
         if len(tasks) > limit:
             raise ValueError("per-core task table exceeds its static bound")
         out[core, 0] = start
         out[core, 1] = count
         out[core, 2] = len(tasks)
-        out[core, 3:3 + len(tasks) * TASK_STRIDE] = torch.tensor(tasks, dtype=torch.int32).flatten()
+        out[core, 3 : 3 + len(tasks) * TASK_STRIDE] = torch.tensor(tasks, dtype=torch.int32).flatten()
     return out
 
 
@@ -238,7 +239,8 @@ def _core_count(q=None):
     """Use the tensor's NPU, or the current NPU when building without a tensor."""
     if not hasattr(torch, "npu"):
         try:
-            import torch_npu  # noqa: F401; registers torch.npu lazily.
+            # Importing registers torch.npu lazily.
+            import torch_npu  # noqa: F401
         except ImportError as exc:
             raise RuntimeError("Automatic core detection requires torch_npu; pass cores explicitly for offline source generation") from exc
     device = q.device if q is not None else torch.npu.current_device()
@@ -249,11 +251,25 @@ def _core_count(q=None):
     return cores
 
 
-def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
-                      pair_dma, prefetch_kv, pipeline_queries,
-                      full_valid_kv, fixed_offset, full_length=False,
-                      workspace_l2_cache="NORMAL_FV", unroll_pairs=False,
-                      input_sq=None, kv_split=1):
+def _build_multi_tile(
+    sq,
+    skv,
+    width,
+    scale,
+    cores,
+    *,
+    pipeline_stages,
+    pair_dma,
+    prefetch_kv,
+    pipeline_queries,
+    full_valid_kv,
+    fixed_offset,
+    full_length=False,
+    workspace_l2_cache="NORMAL_FV",
+    unroll_pairs=False,
+    input_sq=None,
+    kv_split=1,
+):
     """Online attention over contiguous Query ranges.
 
     Full-length runs give each core only (start, count); row, tile, the query
@@ -291,8 +307,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
     packed_tail = bool(packed_kv and width % block)
     legal_indices = bool(full_valid_kv)
     static_full = bool(full_length and legal_indices)
-    direct_kv_l1 = _use_direct_kv_l1(width, full_length, pipeline_queries,
-                                     full_valid_kv, pair_dma, kv_split)
+    direct_kv_l1 = _use_direct_kv_l1(width, full_length, pipeline_queries, full_valid_kv, pair_dma, kv_split)
     meta_cols = 2 if (full_length or not pipeline_queries) else _meta_cols(sq, width, grid)
     # Match the baseline L1 budget for the pipelined path: three KV slots,
     # two P slots and the three Q half slots.
@@ -329,7 +344,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
         start = T.min(first, second)
         delta = T.max(first, second) - start
         if first_valid & second_valid & (delta == 1):
-            T.copy(Cache[start:start + 2, :], nd[token:token + 2, :])
+            T.copy(Cache[start : start + 2, :], nd[token : token + 2, :])
         else:
             # Keep the same row order as the previous paired gather.
             swap = first_valid & second_valid & (first > second) & (delta <= max_pair_delta)
@@ -436,8 +451,9 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                     zero_row(nd, token)
 
     @T.macro
-    def gather_half(Cache, KVWorkspace, index_ub, nd0, nd1, bx, slot,
-                    dst_base, source_start, real_rows, group_pairs, full_rows, first_group_only=False):
+    def gather_half(
+        Cache, KVWorkspace, index_ub, nd0, nd1, bx, slot, dst_base, source_start, real_rows, group_pairs, full_rows, first_group_only=False
+    ):
         # Publish each 16-row half as soon as its MTE2 gathers finish. The next
         # half uses the other UB slot, so its MTE2 work can overlap this MTE3.
         # Keep the loop bound visible to dependency analysis when a tail and
@@ -448,39 +464,42 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                 offset = group * (2 * gather_rows)
                 if full_rows:
                     gather_group(Cache, index_ub, nd0, source_start + offset, gather_rows, True)
-                    T.copy(nd0, KVWorkspace[bx, slot, dst_base + offset:dst_base + offset + gather_rows, :],
-                           l2_cache_ctrl=workspace_l2_cache)
-                    gather_group(Cache, index_ub, nd1, source_start + offset + gather_rows,
-                                 gather_rows, True)
-                    T.copy(nd1, KVWorkspace[bx, slot,
-                           dst_base + offset + gather_rows:dst_base + offset + 2 * gather_rows, :],
-                           l2_cache_ctrl=workspace_l2_cache)
+                    T.copy(
+                        nd0, KVWorkspace[bx, slot, dst_base + offset : dst_base + offset + gather_rows, :], l2_cache_ctrl=workspace_l2_cache
+                    )
+                    gather_group(Cache, index_ub, nd1, source_start + offset + gather_rows, gather_rows, True)
+                    T.copy(
+                        nd1,
+                        KVWorkspace[bx, slot, dst_base + offset + gather_rows : dst_base + offset + 2 * gather_rows, :],
+                        l2_cache_ctrl=workspace_l2_cache,
+                    )
                 else:
-                    gather_group(Cache, index_ub, nd0, source_start + offset,
-                                 T.max(T.min(gather_rows, real_rows - offset), 0), False)
-                    T.copy(nd0, KVWorkspace[bx, slot, dst_base + offset:dst_base + offset + gather_rows, :],
-                           l2_cache_ctrl=workspace_l2_cache)
+                    gather_group(Cache, index_ub, nd0, source_start + offset, T.max(T.min(gather_rows, real_rows - offset), 0), False)
+                    T.copy(
+                        nd0, KVWorkspace[bx, slot, dst_base + offset : dst_base + offset + gather_rows, :], l2_cache_ctrl=workspace_l2_cache
+                    )
                     if not first_group_only:
                         offset1 = offset + gather_rows
-                        gather_group(Cache, index_ub, nd1, source_start + offset1,
-                                     T.max(T.min(gather_rows, real_rows - offset1), 0), False)
-                        T.copy(nd1, KVWorkspace[bx, slot, dst_base + offset1:dst_base + offset1 + gather_rows, :],
-                               l2_cache_ctrl=workspace_l2_cache)
+                        gather_group(Cache, index_ub, nd1, source_start + offset1, T.max(T.min(gather_rows, real_rows - offset1), 0), False)
+                        T.copy(
+                            nd1,
+                            KVWorkspace[bx, slot, dst_base + offset1 : dst_base + offset1 + gather_rows, :],
+                            l2_cache_ctrl=workspace_l2_cache,
+                        )
 
     @T.macro
-    def gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile,
-               slot, sid, nd0, nd1, valid, n, tail64, kv_l1=None):
+    def gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile, slot, sid, nd0, nd1, valid, n, tail64, kv_l1=None):
         index_ub = T.alloc_shared((block,), "int32")
         T.annotate_buffer_versions({index_ub: 1})
         input_row = row // kv_split
         column = (row % kv_split) * width + tile * block
         if width % block == 0:
-            T.copy(Indices[input_row, column:column + block], index_ub)
+            T.copy(Indices[input_row, column : column + block], index_ub)
         else:
             if tile * block + block <= width:
-                T.copy(Indices[input_row, column:column + block], index_ub)
+                T.copy(Indices[input_row, column : column + block], index_ub)
             else:
-                T.copy(Indices[input_row, column:column + 64], index_ub[:64])
+                T.copy(Indices[input_row, column : column + 64], index_ub[:64])
         if static_full:
             if width % block == 0:
                 group_pairs = 2
@@ -536,8 +555,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                             # On the physical 64-column tail, k0 and k1 are
                             # at most 32. Only read the initialized prefix.
                             gather_mask = S.update_mask(k1, width=32)
-                        index1 = S.vgather2(T.access_ptr(index_ub[0], "r", extent=block),
-                                            split_indices, gather_mask)
+                        index1 = S.vgather2(T.access_ptr(index_ub[0], "r", extent=block), split_indices, gather_mask)
                         vis1 = S.pand(vis1, S.vcmps(index1, T.int32(0), full, "ge"), full)
                         vis1 = S.pand(vis1, S.vcmps(index1, T.int32(skv), full, "lt"), full)
                 valid0 = S.vsel(one, zero, vis0)
@@ -560,21 +578,18 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                 start0 = group * 4 * gather_rows
                 start1 = start0 + 2 * gather_rows
                 gather_group(Cache, index_ub, nd0, start0 + sid * gather_rows, gather_rows, False)
-                T.dual_copy(nd0, kv_l1[start0:start0 + 2 * gather_rows, :])
+                T.dual_copy(nd0, kv_l1[start0 : start0 + 2 * gather_rows, :])
                 gather_group(Cache, index_ub, nd1, start1 + sid * gather_rows, gather_rows, False)
-                T.dual_copy(nd1, kv_l1[start1:start1 + 2 * gather_rows, :])
+                T.dual_copy(nd1, kv_l1[start1 : start1 + 2 * gather_rows, :])
         elif sid == 0:
-            gather_half(Cache, KVWorkspace0, index_ub, nd0, nd1, bx, slot,
-                        0, 0, k0, group_pairs, static_full, not full_length and n <= 1)
+            gather_half(Cache, KVWorkspace0, index_ub, nd0, nd1, bx, slot, 0, 0, k0, group_pairs, static_full, not full_length and n <= 1)
         elif full_length or n > 1:
             # Only AIV0 supplies KV for a 16-row Cube tile. AIV1 still
             # produces its validity mask and participates in Vec1 and Vec2.
             if packed_kv:
-                gather_half(Cache, KVWorkspace0, index_ub, nd0, nd1, bx, slot,
-                            block // 2, k0, k1, group_pairs, static_full)
+                gather_half(Cache, KVWorkspace0, index_ub, nd0, nd1, bx, slot, block // 2, k0, k1, group_pairs, static_full)
             else:
-                gather_half(Cache, KVWorkspace1, index_ub, nd0, nd1, bx, slot,
-                            0, k0, k1, group_pairs, static_full)
+                gather_half(Cache, KVWorkspace1, index_ub, nd0, nd1, bx, slot, 0, k0, k1, group_pairs, static_full)
 
     @T.macro
     def load_kv_tile(KVWorkspace0, KVWorkspace1, kv_l1, bx, slot, n, tail64):
@@ -583,7 +598,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
         elif tail64:
             T.copy(KVWorkspace0[bx, slot, :32, :], kv_l1[:32, :])
             if packed_kv:
-                T.copy(KVWorkspace0[bx, slot, block // 2:block // 2 + 32, :], kv_l1[32:64, :])
+                T.copy(KVWorkspace0[bx, slot, block // 2 : block // 2 + 32, :], kv_l1[32:64, :])
             else:
                 T.copy(KVWorkspace1[bx, slot, :32, :], kv_l1[32:64, :])
         elif packed_kv:
@@ -605,8 +620,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
     def load_q_half(Q, q_l1, row, slot, half_idx):
         # Each half is one 64x256 ND2NZ transfer; the GM row stride stays 512.
         input_row = row // kv_split
-        T.copy(Q[input_row * H:(input_row + 1) * H, half_idx * q_half:(half_idx + 1) * q_half],
-               q_l1[slot, :, :])
+        T.copy(Q[input_row * H : (input_row + 1) * H, half_idx * q_half : (half_idx + 1) * q_half], q_l1[slot, :, :])
 
     @T.macro
     def qk(q_l1, kv_l1, qa, kb, scores, score_ub, slot0, slot1, tile_rows):
@@ -614,20 +628,19 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
         # mode keeps QK and PV aliases on one ring even when the outer task
         # pipeline reorders their disjoint, write-first inner-loop owners.
         for sub in T.serial(2):
-            T.copy(q_l1[slot0, :, sub * qk_d:(sub + 1) * qk_d], qa)
-            T.copy(kv_l1[:tile_rows, sub * qk_d:(sub + 1) * qk_d], kb[:tile_rows, :])
-            T.gemm(qa, kb[:tile_rows, :], scores[:, :tile_rows], transpose_B=True,
-                   clear_accum=(sub == 0))
+            T.copy(q_l1[slot0, :, sub * qk_d : (sub + 1) * qk_d], qa)
+            T.copy(kv_l1[:tile_rows, sub * qk_d : (sub + 1) * qk_d], kb[:tile_rows, :])
+            T.gemm(qa, kb[:tile_rows, :], scores[:, :tile_rows], transpose_B=True, clear_accum=(sub == 0))
         for sub in T.serial(2):
-            T.copy(q_l1[slot1, :, sub * qk_d:(sub + 1) * qk_d], qa)
-            T.copy(kv_l1[:tile_rows, (sub + 2) * qk_d:(sub + 3) * qk_d], kb[:tile_rows, :])
-            T.gemm(qa, kb[:tile_rows, :], scores[:, :tile_rows], transpose_B=True,
-                   clear_accum=False)
+            T.copy(q_l1[slot1, :, sub * qk_d : (sub + 1) * qk_d], qa)
+            T.copy(kv_l1[:tile_rows, (sub + 2) * qk_d : (sub + 3) * qk_d], kb[:tile_rows, :])
+            T.gemm(qa, kb[:tile_rows, :], scores[:, :tile_rows], transpose_B=True, clear_accum=False)
         T.dual_copy(scores[:, :tile_rows], score_ub[:, :tile_rows])
 
     @T.macro
-    def softmax_tile(tile, score_ub, valid, raw, stats, p_scale, m, ell, alpha, sink_ub,
-                     tail64, tail_rows, state, task_max, task_sum, masked, short):
+    def softmax_tile(
+        tile, score_ub, valid, raw, stats, p_scale, m, ell, alpha, sink_ub, tail64, tail_rows, state, task_max, task_sum, masked, short
+    ):
         full = S.pset(32, "PAT_ALL")
         heads = S.pset(32, "PAT_VL32")
         scalar = S.pset(32, "PAT_VL1")
@@ -687,8 +700,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
             sink_infinite = S.vcmps(sink, T.infinity("float32"), heads, "eq")
             output_max = S.vmax(new_m, sink, heads)
             old_output_max = S.vmax(old_m, sink, heads)
-            degenerate = S.por(sink_infinite,
-                               S.vcmps(output_max, -T.infinity("float32"), heads, "eq"), heads)
+            degenerate = S.por(sink_infinite, S.vcmps(output_max, -T.infinity("float32"), heads, "eq"), heads)
             output_origin = S.vsel(zero, output_max, degenerate)
             output_alpha = S.vsel(one, S.vexp(S.vsub(old_output_max, output_origin, heads), heads), degenerate)
             output_scale = S.vsel(zero, S.vexp(S.vsub(new_m, output_origin, heads), heads), sink_infinite)
@@ -748,19 +760,52 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
             S.vsts(task_sum[0, 0], total, heads)
 
     @T.macro
-    def softmax(tile, score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink_ub, tail64, tail_rows,
-                state, task_max, task_sum):
+    def softmax(tile, score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink_ub, tail64, tail_rows, state, task_max, task_sum):
         stats = T.alloc_shared((64,), "float32")
         p_scale = T.alloc_shared((64,), "float32")
         raw = T.Tensor((pitch * block,), "bfloat16", prob_ub.data, scope="shared.dyn")
         T.annotate_buffer_versions({stats: 1, p_scale: 1})
         with T.SimdVF():
             if not full_length and tail64:
-                softmax_tile(tile, score_ub, valid, raw, stats, p_scale, m, ell, alpha, sink_ub,
-                             tail64, tail_rows, state, task_max, task_sum, True, True)
+                softmax_tile(
+                    tile,
+                    score_ub,
+                    valid,
+                    raw,
+                    stats,
+                    p_scale,
+                    m,
+                    ell,
+                    alpha,
+                    sink_ub,
+                    tail64,
+                    tail_rows,
+                    state,
+                    task_max,
+                    task_sum,
+                    True,
+                    True,
+                )
             else:
-                softmax_tile(tile, score_ub, valid, raw, stats, p_scale, m, ell, alpha, sink_ub,
-                             tail64, tail_rows, state, task_max, task_sum, not static_full, False)
+                softmax_tile(
+                    tile,
+                    score_ub,
+                    valid,
+                    raw,
+                    stats,
+                    p_scale,
+                    m,
+                    ell,
+                    alpha,
+                    sink_ub,
+                    tail64,
+                    tail_rows,
+                    state,
+                    task_max,
+                    task_sum,
+                    not static_full,
+                    False,
+                )
         # Publish P on MTE3 after both scan passes.
         if full_length:
             T.dual_copy(prob_ub[:half, :], p_l1)
@@ -779,9 +824,8 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
             if not direct_kv_l1:
                 # On the shared L0A ring each panel owns its operand writes.
                 T.copy(p_l1[:, :tile_rows], pa[:, :tile_rows])
-            T.copy(kv_l1[:tile_rows, part * pv_d:(part + 1) * pv_d], vb[:, :tile_rows], transpose=True)
-            T.gemm(pa[:, :tile_rows], vb[:, :tile_rows], product_parts[part, :, :],
-                   transpose_B=True, clear_accum=True)
+            T.copy(kv_l1[:tile_rows, part * pv_d : (part + 1) * pv_d], vb[:, :tile_rows], transpose=True)
+            T.gemm(pa[:, :tile_rows], vb[:, :tile_rows], product_parts[part, :, :], transpose_B=True, clear_accum=True)
         T.dual_copy(product, product_ub)
 
     @T.macro
@@ -825,8 +869,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                         S.vsts(accum[h, chunk * 64], value, full, "NORM_B32")
 
     @T.macro
-    def finish(row, O, MaxLogits, LSE, accum, out_ub, m, ell, sink_ub,
-               max_ub, lse_ub, inv_ub, sid, state):
+    def finish(row, O, MaxLogits, LSE, accum, out_ub, m, ell, sink_ub, max_ub, lse_ub, inv_ub, sid, state):
         with T.SimdVF():
             full = S.pset(32, "PAT_ALL")
             heads = S.pset(32, "PAT_VL32")
@@ -851,8 +894,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
             else:
                 kv_term = safe_total
                 sink_term = S.vexp(S.vsub(sink, origin, heads), heads)
-            inverse = S.vsel(S.vdiv(one, S.vadd(kv_term, sink_term, heads), heads,
-                                   precision="exact"), zero, nonempty)
+            inverse = S.vsel(S.vdiv(one, S.vadd(kv_term, sink_term, heads), heads, precision="exact"), zero, nonempty)
             S.vsts(max_ub[0], maximum, heads, extent=half)
             S.vsts(lse_ub[0], lse, heads, extent=half)
             S.vsts(inv_ub[0], inverse, heads, extent=half)
@@ -870,30 +912,31 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                         S.vsts(out_ub[h, chunk * 64], packed, full, "PK_B32")
         if pipeline_queries:
             start = row * H + sid * half
-            T.copy(out_ub, O[start:start + half, :])
-            T.copy(max_ub, MaxLogits[start:start + half])
-            T.copy(lse_ub, LSE[start:start + half])
+            T.copy(out_ub, O[start : start + half, :])
+            T.copy(max_ub, MaxLogits[start : start + half])
+            T.copy(lse_ub, LSE[start : start + half])
         else:
-            T.dual_copy(out_ub, O[row * H:(row + 1) * H, :])
-            T.dual_copy(max_ub, MaxLogits[row * H:(row + 1) * H])
-            T.dual_copy(lse_ub, LSE[row * H:(row + 1) * H])
+            T.dual_copy(out_ub, O[row * H : (row + 1) * H, :])
+            T.dual_copy(max_ub, MaxLogits[row * H : (row + 1) * H])
+            T.dual_copy(lse_ub, LSE[row * H : (row + 1) * H])
 
     @T.prim_func
-    def main(Q: T.Tensor((input_sq * H, D), "bfloat16"),
-             Cache: T.Tensor((skv, D), "bfloat16"),
-             Indices: T.Tensor((input_sq, input_width), "int32"),
-             Lengths: T.Tensor((input_sq,), "int32"),
-             Extra: T.Tensor((1, D), "bfloat16"),
-             ExtraIndices: T.Tensor((input_sq, 1), "int32"),
-             ExtraLengths: T.Tensor((input_sq,), "int32"),
-             Sink: T.Tensor((H,), "float32"),
-             Meta: T.Tensor((grid, meta_cols), "int32"),
-             KVWorkspace0: T.Tensor((1,) if direct_kv_l1 else
-                                    (grid, kv_slots, block if packed_kv else block // 2, D), "bfloat16"),
-             KVWorkspace1: T.Tensor((1,) if packed_kv else (grid, kv_slots, block // 2, D), "bfloat16"),
-             O: T.Tensor((sq * H, D), output_dtype),
-             MaxLogits: T.Tensor((sq * H,), "float32"),
-             LSE: T.Tensor((sq * H,), "float32")):
+    def main(
+        Q: T.Tensor((input_sq * H, D), "bfloat16"),
+        Cache: T.Tensor((skv, D), "bfloat16"),
+        Indices: T.Tensor((input_sq, input_width), "int32"),
+        Lengths: T.Tensor((input_sq,), "int32"),
+        Extra: T.Tensor((1, D), "bfloat16"),
+        ExtraIndices: T.Tensor((input_sq, 1), "int32"),
+        ExtraLengths: T.Tensor((input_sq,), "int32"),
+        Sink: T.Tensor((H,), "float32"),
+        Meta: T.Tensor((grid, meta_cols), "int32"),
+        KVWorkspace0: T.Tensor((1,) if direct_kv_l1 else (grid, kv_slots, block if packed_kv else block // 2, D), "bfloat16"),
+        KVWorkspace1: T.Tensor((1,) if packed_kv else (grid, kv_slots, block // 2, D), "bfloat16"),
+        O: T.Tensor((sq * H, D), output_dtype),
+        MaxLogits: T.Tensor((sq * H,), "float32"),
+        LSE: T.Tensor((sq * H,), "float32"),
+    ):
         with T.MixedKernel(grid, sids=2) as (bx, sid):
             # Keep the slot axis outside the NZ matrix so every half has its
             # own compact layout and 64-row NZ pitch.
@@ -936,17 +979,35 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
             max_ub = T.alloc_shared((half,), "float32")
             lse_ub = T.alloc_shared((half,), "float32")
             inv_ub = T.alloc_shared((half,), "float32")
-            T.annotate_layout({prob_ub: make_ascend_compact_nz_layout(prob_ub),
-                               product: make_ascend_l0c_layout(product)})
+            T.annotate_layout({prob_ub: make_ascend_compact_nz_layout(prob_ub), product: make_ascend_l0c_layout(product)})
             # QK's K loops and PV's N loop are disjoint owners of L0B.
             # Counter versioning alternates slots at every operand panel.
-            T.annotate_buffer_versions({kv_l1: kv_versions, p_l1: p_versions,
-                qa: (2, "counter"), kb: (2, "counter"),
-                scores: 1, product_parts: 1, product: 1, nd0: 1, nd1: 1,
-                valid: 1 if static_full else ((3, "iteration") if pipeline_queries else 1),
-                score_ub: (2, "iteration") if pipeline_queries else 1, prob_ub: 1, product_ub: 1, accum: 1,
-                out_ub: 1, m: 1, ell: 1, alpha: (2, "iteration") if pipeline_queries else 1,
-                sink_ub: 1, max_ub: 1, lse_ub: 1, inv_ub: 1})
+            T.annotate_buffer_versions(
+                {
+                    kv_l1: kv_versions,
+                    p_l1: p_versions,
+                    qa: (2, "counter"),
+                    kb: (2, "counter"),
+                    scores: 1,
+                    product_parts: 1,
+                    product: 1,
+                    nd0: 1,
+                    nd1: 1,
+                    valid: 1 if static_full else ((3, "iteration") if pipeline_queries else 1),
+                    score_ub: (2, "iteration") if pipeline_queries else 1,
+                    prob_ub: 1,
+                    product_ub: 1,
+                    accum: 1,
+                    out_ub: 1,
+                    m: 1,
+                    ell: 1,
+                    alpha: (2, "iteration") if pipeline_queries else 1,
+                    sink_ub: 1,
+                    max_ub: 1,
+                    lse_ub: 1,
+                    inv_ub: 1,
+                }
+            )
             # The manual Q ring is aggressive, but its row-based slot ids are
             # not a linear counter. In a full-length flat run with a 64-row
             # tail InsertSync cannot prove the cross-iteration ring, so that
@@ -958,7 +1019,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                 initial_sink = -T.infinity("float32") if kv_split > 1 else T.float32(0)
                 S.vsts(sink_ub[0], S.vdup(initial_sink, "float32", full), full)
             if kv_split == 1:
-                T.copy(Sink[sid * half:(sid + 1) * half], sink_ub[:half])
+                T.copy(Sink[sid * half : (sid + 1) * half], sink_ub[:half])
             # Cost-balanced contiguous query ownership: the wrapper supplies
             # each core's start/count and, for the task pipeline, a flat list
             # of its S2 tasks. A -1 header keeps the equal-count fallback.
@@ -990,8 +1051,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                     first_q1 = T.floormod(first_row * 2 + 1, q_slots)
                     load_q_half(Q, q_l1, first_row, first_q, 0)
                     load_q_half(Q, q_l1, first_row, first_q1, 1)
-                for task in T.Pipelined(task_count, num_stages=4,
-                                        annotations={"enable_offset": True}):
+                for task in T.Pipelined(task_count, num_stages=4, annotations={"enable_offset": True}):
                     if full_length:
                         row = T.min(start + task // tiles_per_query, sq - 1)
                         tile = task % tiles_per_query
@@ -1020,50 +1080,41 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                     tail_rows = tail_rows_for(n)
                     if direct_kv_l1:
                         with T.Stage(1):
-                            gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile,
-                                   slot, sid, nd0, nd1, valid, n, tail64, kv_l1)
+                            gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile, slot, sid, nd0, nd1, valid, n, tail64, kv_l1)
                     else:
                         with T.Stage(0):
-                            gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile,
-                                   slot, sid, nd0, nd1, valid, n, tail64)
+                            gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile, slot, sid, nd0, nd1, valid, n, tail64)
                         with T.Stage(1):
                             load_kv(KVWorkspace0, KVWorkspace1, kv_l1, bx, slot, n, tail64)
                     with T.Stage(2):
                         if tail64:
-                            qk_tail(q_l1, kv_l1, qa, kb, scores, score_ub, qslot,
-                                    qslot1, n)
+                            qk_tail(q_l1, kv_l1, qa, kb, scores, score_ub, qslot, qslot1, n)
                         else:
-                            qk(q_l1, kv_l1, qa, kb, scores, score_ub, qslot,
-                               qslot1, block)
+                            qk(q_l1, kv_l1, qa, kb, scores, score_ub, qslot, qslot1, block)
                         # The last QK read has drained both halves of this
                         # query. Issue the next query's two DMA copies after
                         # that read and before this task's PV FIXP.
-                        if last:
-                            if task + 1 < task_count:
-                                if full_length:
-                                    next_row = T.min(start + (task + 1) // tiles_per_query, sq - 1)
-                                else:
-                                    next_base = 3 + (task + 1) * TASK_STRIDE
-                                    next_row = T.max(T.min(Meta[bx, next_base], sq - 1), 0)
-                                next_q = T.floormod(next_row * 2, q_slots)
-                                next_q1 = T.floormod(next_row * 2 + 1, q_slots)
-                                load_q_half(Q, q_l1, next_row, next_q, 0)
-                                load_q_half(Q, q_l1, next_row, next_q1, 1)
+                        if last & (task + 1 < task_count):
+                            if full_length:
+                                next_row = T.min(start + (task + 1) // tiles_per_query, sq - 1)
+                            else:
+                                next_base = 3 + (task + 1) * TASK_STRIDE
+                                next_row = T.max(T.min(Meta[bx, next_base], sq - 1), 0)
+                            next_q = T.floormod(next_row * 2, q_slots)
+                            next_q1 = T.floormod(next_row * 2 + 1, q_slots)
+                            load_q_half(Q, q_l1, next_row, next_q, 0)
+                            load_q_half(Q, q_l1, next_row, next_q1, 1)
                     with T.Stage(2):
-                        softmax(tile, score_ub, valid, prob_ub, p_l1, m, ell, alpha,
-                                sink_ub, tail64, tail_rows, state, task_max, task_sum)
+                        softmax(tile, score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink_ub, tail64, tail_rows, state, task_max, task_sum)
                     with T.Stage(3):
                         if tail64:
-                            pv_tail(kv_l1, p_l1, pa, vb, product_parts, product,
-                                    product_ub, n)
+                            pv_tail(kv_l1, p_l1, pa, vb, product_parts, product, product_ub, n)
                         else:
-                            pv(kv_l1, p_l1, pa, vb, product_parts, product,
-                               product_ub, block)
+                            pv(kv_l1, p_l1, pa, vb, product_parts, product, product_ub, block)
                     with T.Stage(3):
                         update_output(tile, product_ub, accum, alpha)
                         if last:
-                            finish(row, O, MaxLogits, LSE, accum, out_ub, task_max, task_sum,
-                                   sink_ub, max_ub, lse_ub, inv_ub, sid, 0)
+                            finish(row, O, MaxLogits, LSE, accum, out_ub, task_max, task_sum, sink_ub, max_ub, lse_ub, inv_ub, sid, 0)
             else:
                 # Startup load for the first query, then rotate the half slots
                 # (0,1) -> (2,0) -> (1,2) by advancing two slots per query.
@@ -1086,8 +1137,7 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                     if full_length:
                         tiles_eff = tiles_per_query
                     else:
-                        slice_length = T.max(T.min(Lengths[row // kv_split] -
-                                                    (row % kv_split) * width, width), 0)
+                        slice_length = T.max(T.min(Lengths[row // kv_split] - (row % kv_split) * width, width), 0)
                         tiles_eff = T.max(T.ceildiv(slice_length, block), 1)
                     for tile in T.Pipelined(tiles_eff, num_stages=stages):
                         slot = (workspace_base + tile) % kv_slots
@@ -1099,19 +1149,16 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                                 tail64 = tile + 1 == tiles_per_query
                                 n = T.if_then_else(tail64, BLOCK_K, block)
                         else:
-                            n = T.max(T.min(Lengths[row // kv_split] -
-                                            (row % kv_split) * width - tile * block, block), 0)
+                            n = T.max(T.min(Lengths[row // kv_split] - (row % kv_split) * width - tile * block, block), 0)
                             tail64 = n <= 64
                         tail_rows = tail_rows_for(n)
-                        gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile,
-                               slot, sid, nd0, nd1, valid, n, tail64)
+                        gather(Cache, Indices, KVWorkspace0, KVWorkspace1, bx, row, tile, slot, sid, nd0, nd1, valid, n, tail64)
                         load_kv(KVWorkspace0, KVWorkspace1, kv_l1, bx, slot, n, tail64)
                         if tail64:
                             qk_tail(q_l1, kv_l1, qa, kb, scores, score_ub, slot0, slot1, n)
                         else:
                             qk(q_l1, kv_l1, qa, kb, scores, score_ub, slot0, slot1, block)
-                        softmax(tile, score_ub, valid, prob_ub, p_l1, m, ell, alpha,
-                                sink_ub, tail64, tail_rows, 0, task_max, task_sum)
+                        softmax(tile, score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink_ub, tail64, tail_rows, 0, task_max, task_sum)
                         if tail64:
                             pv_tail(kv_l1, p_l1, pa, vb, product_parts, product, product_ub, n)
                         else:
@@ -1122,15 +1169,29 @@ def _build_multi_tile(sq, skv, width, scale, cores, *, pipeline_stages,
                     if query + 1 < count:
                         load_q_half(Q, q_l1, row + 1, nslot0, 0)
                         load_q_half(Q, q_l1, row + 1, nslot1, 1)
-                    finish(row, O, MaxLogits, LSE, accum, out_ub, m, ell,
-                           sink_ub, max_ub, lse_ub, inv_ub, sid, 0)
+                    finish(row, O, MaxLogits, LSE, accum, out_ub, m, ell, sink_ub, max_ub, lse_ub, inv_ub, sid, 0)
+
     return main
 
 
-def build_prefill_kernel(sq, skv, width, sm_scale=SM_SCALE, cores=None, *, pipeline_stages=2, pair_dma=False,
-                         prefetch_kv=True, pipeline_queries=False, full_valid_kv=False, fixed_offset=None,
-                         full_length=False, workspace_l2_cache="NORMAL_FV", unroll_pairs=False,
-                         kv_split=1):
+def build_prefill_kernel(
+    sq,
+    skv,
+    width,
+    sm_scale=SM_SCALE,
+    cores=None,
+    *,
+    pipeline_stages=2,
+    pair_dma=False,
+    prefetch_kv=True,
+    pipeline_queries=False,
+    full_valid_kv=False,
+    fixed_offset=None,
+    full_length=False,
+    workspace_l2_cache="NORMAL_FV",
+    unroll_pairs=False,
+    kv_split=1,
+):
     """Build the prefill PrimFunc with an internal KV workspace.
 
     Sq and Skv must be positive. Every positive multiple of 64 for T uses the
@@ -1174,19 +1235,35 @@ def build_prefill_kernel(sq, skv, width, sm_scale=SM_SCALE, cores=None, *, pipel
     scale = _check_scale(sm_scale)
     fixed_offset = _check_fixed_offset(fixed_offset)
     prefetch_kv = bool(prefetch_kv and pipeline_stages == 2)
-    options = dict(pipeline_stages=pipeline_stages, prefetch_kv=prefetch_kv,
-                   pipeline_queries=bool(pipeline_queries and prefetch_kv), full_valid_kv=bool(full_valid_kv),
-                   fixed_offset=fixed_offset)
-    return _build_multi_tile(sq * kv_split, skv, width // kv_split, scale, cores, pair_dma=pair_dma,
-                             full_length=bool(full_length), workspace_l2_cache=workspace_l2_cache,
-                             unroll_pairs=bool(unroll_pairs), input_sq=sq, kv_split=kv_split, **options)
+    options = dict(
+        pipeline_stages=pipeline_stages,
+        prefetch_kv=prefetch_kv,
+        pipeline_queries=bool(pipeline_queries and prefetch_kv),
+        full_valid_kv=bool(full_valid_kv),
+        fixed_offset=fixed_offset,
+    )
+    return _build_multi_tile(
+        sq * kv_split,
+        skv,
+        width // kv_split,
+        scale,
+        cores,
+        pair_dma=pair_dma,
+        full_length=bool(full_length),
+        workspace_l2_cache=workspace_l2_cache,
+        unroll_pairs=bool(unroll_pairs),
+        input_sq=sq,
+        kv_split=kv_split,
+        **options,
+    )
 
 
 class _WorkspaceKernel:
     """Reuse the internal GM workspace across launches on the same stream."""
 
-    def __init__(self, kernel, shape, *, task_pipeline=False, width=None, full_length=False, packed_kv=False,
-                 direct_kv_l1=False, kv_split=1):
+    def __init__(
+        self, kernel, shape, *, task_pipeline=False, width=None, full_length=False, packed_kv=False, direct_kv_l1=False, kv_split=1
+    ):
         self._kernel = kernel
         self._shape = tuple(shape)
         if direct_kv_l1:
@@ -1226,13 +1303,11 @@ class _WorkspaceKernel:
         if cached is None or cached[0] != key:
             # Launches on different streams may overlap. Allocate the replacement
             # on the launch stream so the allocator tracks outstanding uses there.
-            workspace = tuple(torch.empty(shape, dtype=torch.bfloat16, device=q.device)
-                              for shape in self._workspace_shapes)
+            workspace = tuple(torch.empty(shape, dtype=torch.bfloat16, device=q.device) for shape in self._workspace_shapes)
             self._workspace = (key, workspace)
         else:
             workspace = cached[1]
-        return self._kernel(q, kv, indices, lengths, unused_kv, unused_indices,
-                            zeros, sink, meta, *workspace)
+        return self._kernel(q, kv, indices, lengths, unused_kv, unused_indices, zeros, sink, meta, *workspace)
 
     def get_kernel_source(self):
         return self._kernel.get_kernel_source()
@@ -1249,8 +1324,7 @@ class _WorkspaceKernel:
             lengths = (lengths - offsets).clamp(0, self._width).reshape(-1)
         else:
             lengths = None
-        return _cost_meta(lengths, rows * self._kv_split, self._shape[0], self._full_length,
-                          self._width, task_pipeline=self._task_pipeline)
+        return _cost_meta(lengths, rows * self._kv_split, self._shape[0], self._full_length, self._width, task_pipeline=self._task_pipeline)
 
 
 def _kv_split_factor(sq, width, cores, requested=None, full_length=True, max_topk_length=None):
@@ -1260,6 +1334,7 @@ def _kv_split_factor(sq, width, cores, requested=None, full_length=True, max_top
     work. Variable lengths without a validated host bound stay unsplit.
     """
     import os
+
     if requested is None:
         env = os.environ.get("MLA_KV_SPLIT", "auto").strip()
         if env.lower() in ("off", "0", "none", "disabled"):
@@ -1289,8 +1364,7 @@ def _kv_split_factor(sq, width, cores, requested=None, full_length=True, max_top
         break
     if requested is not None:
         requested = int(requested)
-        if (requested > 1 and width % requested == 0
-                and (width // requested) % 64 == 0 and sq * requested <= cores):
+        if requested > 1 and width % requested == 0 and (width // requested) % 64 == 0 and sq * requested <= cores:
             split = requested
         elif requested <= 1:
             split = 1
@@ -1314,8 +1388,7 @@ class _SplitKernel:
         return self._inner.prepare_benchmark_metadata(inputs)
 
     def __call__(self, q, kv, indices, lengths, unused_kv, unused_indices, zeros, sink, meta=None):
-        partial, maximum, lse = self._inner(q, kv, indices, lengths, unused_kv, unused_indices,
-                                          zeros, sink, meta)
+        partial, maximum, lse = self._inner(q, kv, indices, lengths, unused_kv, unused_indices, zeros, sink, meta)
         return self._merge(partial, maximum, lse, sink)
 
 
@@ -1328,13 +1401,15 @@ def build_kv_merge_kernel(sq, split, cores):
     grid = min(rows, 2 * cores)
 
     @T.prim_func
-    def main(Partial: T.Tensor((sq * split * H, D), "float32"),
-             PartialMax: T.Tensor((sq * split * H,), "float32"),
-             PartialLSE: T.Tensor((sq * split * H,), "float32"),
-             Sink: T.Tensor((H,), "float32"),
-             O: T.Tensor((rows, D), "bfloat16"),
-             MaxLogits: T.Tensor((rows,), "float32"),
-             LSE: T.Tensor((rows,), "float32")):
+    def main(
+        Partial: T.Tensor((sq * split * H, D), "float32"),
+        PartialMax: T.Tensor((sq * split * H,), "float32"),
+        PartialLSE: T.Tensor((sq * split * H,), "float32"),
+        Sink: T.Tensor((H,), "float32"),
+        O: T.Tensor((rows, D), "bfloat16"),
+        MaxLogits: T.Tensor((rows,), "float32"),
+        LSE: T.Tensor((rows,), "float32"),
+    ):
         with T.Kernel(grid) as bx:
             values = T.alloc_shared((split, D), "float32")
             maxima = T.alloc_shared((split, H), "float32")
@@ -1344,18 +1419,17 @@ def build_kv_merge_kernel(sq, split, cores):
             out = T.alloc_shared((D,), "bfloat16")
             max_ub = T.alloc_shared((64,), "float32")
             lse_ub = T.alloc_shared((64,), "float32")
-            T.annotate_buffer_versions({values: 1, maxima: 1, logs: 1, weights: 1,
-                                       sink_ub: 1, out: 1, max_ub: 1, lse_ub: 1})
+            T.annotate_buffer_versions({values: 1, maxima: 1, logs: 1, weights: 1, sink_ub: 1, out: 1, max_ub: 1, lse_ub: 1})
             for step in T.serial(T.ceildiv(rows, grid)):
                 row = step * grid + bx
                 if row < rows:
                     query, head = row // H, row % H
-                    T.copy(Sink[head:head + 1], sink_ub[:1])
+                    T.copy(Sink[head : head + 1], sink_ub[:1])
                     for piece in T.serial(split):
                         base = (query * split + piece) * H
                         T.copy(Partial[base + head, :], values[piece, :])
-                        T.copy(PartialMax[base:base + H], maxima[piece, :])
-                        T.copy(PartialLSE[base:base + H], logs[piece, :])
+                        T.copy(PartialMax[base : base + H], maxima[piece, :])
+                        T.copy(PartialLSE[base : base + H], logs[piece, :])
                     with T.SimdVF():
                         full = S.pset(32, "PAT_ALL")
                         zero = S.vdup(T.float32(0), "float32", full)
@@ -1405,8 +1479,9 @@ def build_kv_merge_kernel(sq, split, cores):
                             packed = S.vcvt(result, "bfloat16", full, sat=False, part=0)
                             S.vsts(out[chunk * 64], packed, full, "PK_B32")
                     T.copy(out, O[row, :])
-                    T.copy(max_ub[:1], MaxLogits[row:row + 1])
-                    T.copy(lse_ub[:1], LSE[row:row + 1])
+                    T.copy(max_ub[:1], MaxLogits[row : row + 1])
+                    T.copy(lse_ub[:1], LSE[row : row + 1])
+
     return main
 
 
@@ -1416,51 +1491,120 @@ def _resolve_query_pipeline(sq, width, cores, prefetch_kv, requested):
     return (width > KV_TILE_ROWS or sq > cores) if requested is None else bool(requested)
 
 
-def _compile_prefill(sq, skv, width, scale, cores, *, pair_dma=False, prefetch_kv=True,
-                     pipeline_queries=None, full_valid_kv=False, fixed_offset=None,
-                     full_length=False, workspace_l2_cache="NORMAL_FV", unroll_pairs=False,
-                     kv_split=None, max_topk_length=None):
+def _compile_prefill(
+    sq,
+    skv,
+    width,
+    scale,
+    cores,
+    *,
+    pair_dma=False,
+    prefetch_kv=True,
+    pipeline_queries=None,
+    full_valid_kv=False,
+    fixed_offset=None,
+    full_length=False,
+    workspace_l2_cache="NORMAL_FV",
+    unroll_pairs=False,
+    kv_split=None,
+    max_topk_length=None,
+):
     # Resolve environment overrides before the cache lookup so a stale cached
     # kernel never hides a requested change of partitioning.
     split = _kv_split_factor(sq, width, cores, kv_split, full_length, max_topk_length)
     stream = _resolve_query_pipeline(sq, width, cores, prefetch_kv, pipeline_queries)
-    return _compile_prefill_cached(sq, skv, width, scale, cores, bool(pair_dma), bool(prefetch_kv),
-                                   stream, bool(full_valid_kv), fixed_offset, bool(full_length),
-                                   workspace_l2_cache, bool(unroll_pairs), split)
+    return _compile_prefill_cached(
+        sq,
+        skv,
+        width,
+        scale,
+        cores,
+        bool(pair_dma),
+        bool(prefetch_kv),
+        stream,
+        bool(full_valid_kv),
+        fixed_offset,
+        bool(full_length),
+        workspace_l2_cache,
+        bool(unroll_pairs),
+        split,
+    )
 
 
 @lru_cache(maxsize=32)
-def _compile_prefill_cached(sq, skv, width, scale, cores, pair_dma, prefetch_kv, pipeline_queries,
-                            full_valid_kv, fixed_offset, full_length, workspace_l2_cache,
-                            unroll_pairs, split):
+def _compile_prefill_cached(
+    sq,
+    skv,
+    width,
+    scale,
+    cores,
+    pair_dma,
+    prefetch_kv,
+    pipeline_queries,
+    full_valid_kv,
+    fixed_offset,
+    full_length,
+    workspace_l2_cache,
+    unroll_pairs,
+    split,
+):
     import tilelang
     from tvm.target import Target
+
     with Target("ascend") as target:
         kernel = tilelang.compile(
-            build_prefill_kernel(sq, skv, width, scale, cores, pair_dma=pair_dma,
-                                 prefetch_kv=prefetch_kv, pipeline_queries=pipeline_queries,
-                                 full_valid_kv=full_valid_kv, fixed_offset=fixed_offset,
-                                 full_length=full_length, workspace_l2_cache=workspace_l2_cache,
-                                 unroll_pairs=unroll_pairs, kv_split=split),
-            target=target, execution_backend="tvm_ffi", out_idx=[11, 12, 13])
+            build_prefill_kernel(
+                sq,
+                skv,
+                width,
+                scale,
+                cores,
+                pair_dma=pair_dma,
+                prefetch_kv=prefetch_kv,
+                pipeline_queries=pipeline_queries,
+                full_valid_kv=full_valid_kv,
+                fixed_offset=fixed_offset,
+                full_length=full_length,
+                workspace_l2_cache=workspace_l2_cache,
+                unroll_pairs=unroll_pairs,
+                kv_split=split,
+            ),
+            target=target,
+            execution_backend="tvm_ffi",
+            out_idx=[11, 12, 13],
+        )
         grid = min(sq * split, cores)
         stream = pipeline_queries and prefetch_kv
-        inner = _WorkspaceKernel(kernel, (grid, KV_WORKSPACE_SLOTS, KV_TILE_ROWS // 2, D),
-                                 task_pipeline=stream, width=width // split, full_length=full_length,
-                                 packed_kv=_packed_kv_workspace(width // split, full_length, stream, full_valid_kv),
-                                 direct_kv_l1=_use_direct_kv_l1(width // split, full_length, stream,
-                                                                full_valid_kv, pair_dma, split),
-                                 kv_split=split)
+        inner = _WorkspaceKernel(
+            kernel,
+            (grid, KV_WORKSPACE_SLOTS, KV_TILE_ROWS // 2, D),
+            task_pipeline=stream,
+            width=width // split,
+            full_length=full_length,
+            packed_kv=_packed_kv_workspace(width // split, full_length, stream, full_valid_kv),
+            direct_kv_l1=_use_direct_kv_l1(width // split, full_length, stream, full_valid_kv, pair_dma, split),
+            kv_split=split,
+        )
         if split == 1:
             return inner
-        merge = tilelang.compile(build_kv_merge_kernel(sq, split, cores), target=target,
-                                 execution_backend="tvm_ffi", out_idx=[4, 5, 6])
+        merge = tilelang.compile(build_kv_merge_kernel(sq, split, cores), target=target, execution_backend="tvm_ffi", out_idx=[4, 5, 6])
         return _SplitKernel(inner, merge, sq, split, width)
 
 
-def flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v=512,
-                         attn_sink=None, topk_length=None, *, validate_values=True, pipeline_queries=None,
-                         full_valid_kv=False, fixed_offset=None):
+def flash_mla_sparse_fwd(
+    q,
+    kv,
+    indices,
+    sm_scale,
+    d_v=512,
+    attn_sink=None,
+    topk_length=None,
+    *,
+    validate_values=True,
+    pipeline_queries=None,
+    full_valid_kv=False,
+    fixed_offset=None,
+):
     """[Sq,64,512] BF16 -> (O BF16, max_logits FP32, lse FP32).
 
     indices has shape [Sq,1,T], where T can be any positive multiple of 64.
@@ -1519,10 +1663,8 @@ def flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v=512,
     if attn_sink is not None:
         _check_tensor("attn_sink", attn_sink, (H,), torch.float32, q.device)
     _require_npu(q)
-    lengths = (_constant_on_device((sq,), width, torch.int32, q.device)
-               if topk_length is None else topk_length.contiguous())
-    sink = (_constant_on_device((H,), -math.inf, torch.float32, q.device)
-            if attn_sink is None else attn_sink.contiguous())
+    lengths = _constant_on_device((sq,), width, torch.int32, q.device) if topk_length is None else topk_length.contiguous()
+    sink = _constant_on_device((H,), -math.inf, torch.float32, q.device) if attn_sink is None else attn_sink.contiguous()
     # The reserved ExtraIndices/ExtraLengths arguments are never read by the
     # shared main kernel; reuse a correctly shaped INT32 tensor as their ABI
     # placeholder instead of allocating and transferring zeros per call.
@@ -1551,6 +1693,5 @@ def flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v=512,
         # Full prefixes use the kernel's cached equal-range header. Varying
         # prefixes use the same virtual-query metadata builder as benchmarks.
         meta = None if full_length else kernel.prepare_metadata(host_lengths, sq).to(q.device)
-        o, max_logits, lse = kernel(flat_q, kv_flat, idx, lengths, kv_flat[:1],
-                                    zeros.view(sq, 1), zeros, sink, meta)
+        o, max_logits, lse = kernel(flat_q, kv_flat, idx, lengths, kv_flat[:1], zeros.view(sq, 1), zeros, sink, meta)
     return o.view(sq, H, D), max_logits.view(sq, H), lse.view(sq, H)

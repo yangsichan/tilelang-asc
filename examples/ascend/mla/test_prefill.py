@@ -17,23 +17,24 @@ def device():
 
 
 def _prefill(q, kv, indices, lengths, *, sink=None):
-    out, max_logits, lse = flash_mla_sparse_fwd(
-        q, kv, indices, SM_SCALE, attn_sink=sink, topk_length=lengths)
+    out, max_logits, lse = flash_mla_sparse_fwd(q, kv, indices, SM_SCALE, attn_sink=sink, topk_length=lengths)
     torch.npu.synchronize()
     return out, max_logits, lse
 
 
-@pytest.mark.parametrize("seq_len,kv_len,index_width,sink", [
-    (16, 1024, 128, False),
-    (8, 4096, 512, True),
-    (3, 512, 192, False),
-])
+@pytest.mark.parametrize(
+    "seq_len,kv_len,index_width,sink",
+    [
+        (16, 1024, 128, False),
+        (8, 4096, 512, True),
+        (3, 512, 192, False),
+    ],
+)
 def test_prefill_matches_reference(device, seq_len, kv_len, index_width, sink):
     """Sq/Skv dynamic, T a multiple of 64, optional sink."""
     q, kv, indices, lengths = make_prefill_inputs(seq_len, kv_len, index_width)
     attn_sink = make_sink(enabled=sink)
-    expected_out, expected_max, expected_lse = reference_prefill(
-        q, kv, indices, topk_length=lengths, attn_sink=attn_sink)
+    expected_out, expected_max, expected_lse = reference_prefill(q, kv, indices, topk_length=lengths, attn_sink=attn_sink)
     q, kv, indices, lengths = (tensor.to(device) for tensor in (q, kv, indices, lengths))
     if attn_sink is not None:
         attn_sink = attn_sink.to(device)
@@ -46,8 +47,7 @@ def test_prefill_variable_lengths_and_empty_rows(device):
     seq_len, kv_len, index_width = 4, 1024, 192
     q, kv, indices, _ = make_prefill_inputs(seq_len, kv_len, index_width)
     lengths = torch.tensor([0, 1, 65, 131], dtype=torch.int32)
-    expected_out, expected_max, expected_lse = reference_prefill(
-        q, kv, indices, topk_length=lengths)
+    expected_out, expected_max, expected_lse = reference_prefill(q, kv, indices, topk_length=lengths)
     q, kv, indices, lengths = (tensor.to(device) for tensor in (q, kv, indices, lengths))
     out, max_logits, lse = _prefill(q, kv, indices, lengths)
     _check_prefill(out, max_logits, lse, expected_out, expected_max, expected_lse, seq_len)
@@ -62,8 +62,7 @@ def test_prefill_all_invalid_indices(device):
     q, kv, indices, lengths = make_prefill_inputs(seq_len, kv_len, index_width)
     indices = torch.full_like(indices, -1)
     indices[:, 0, : index_width // 2] = kv_len  # out-of-range tail
-    expected_out, expected_max, expected_lse = reference_prefill(
-        q, kv, indices, topk_length=lengths)
+    expected_out, expected_max, expected_lse = reference_prefill(q, kv, indices, topk_length=lengths)
     q, kv, indices, lengths = (tensor.to(device) for tensor in (q, kv, indices, lengths))
     out, max_logits, lse = _prefill(q, kv, indices, lengths)
     _check_prefill(out, max_logits, lse, expected_out, expected_max, expected_lse, seq_len)

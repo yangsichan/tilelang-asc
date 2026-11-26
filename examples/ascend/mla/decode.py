@@ -55,17 +55,23 @@ def _auto_kv_pipeline(batch, width, extra_topk, cores, static_lengths, *, enable
         # Device A/B covered four to five queries per core and one or two
         # complete packed tiles per query. Keep this first policy in that regime.
         kv_rows = width + extra_topk
-        return (static_lengths and not enable_batch_invariant and batch >= 4 * cores
-                and extra_topk % BLOCK_K == 0 and kv_rows % KV_TILE_ROWS == 0
-                and kv_rows <= 2 * KV_TILE_ROWS)
-    if (static_lengths and not enable_batch_invariant
-            and (_long_single_cache_stream(batch, width, extra_topk, cores)
-                 or _short_single_cache_stream(batch, width, extra_topk, cores))):
+        return (
+            static_lengths
+            and not enable_batch_invariant
+            and batch >= 4 * cores
+            and extra_topk % BLOCK_K == 0
+            and kv_rows % KV_TILE_ROWS == 0
+            and kv_rows <= 2 * KV_TILE_ROWS
+        )
+    if (
+        static_lengths
+        and not enable_batch_invariant
+        and (_long_single_cache_stream(batch, width, extra_topk, cores) or _short_single_cache_stream(batch, width, extra_topk, cores))
+    ):
         return True
     # Static 128-row tiles share one stream across queries. With runtime lengths
     # the producer restarts per query, so keep the legacy multi-tile condition.
-    return (batch >= 2 * cores
-            and (_decode_tiles(width, 0) >= 2 or (static_lengths and width >= KV_TILE_ROWS)))
+    return batch >= 2 * cores and (_decode_tiles(width, 0) >= 2 or (static_lengths and width >= KV_TILE_ROWS))
 
 
 def _check_kv_split(batch, width, extra_topk, cores, kv_split):
@@ -95,8 +101,7 @@ def _kv_dequantization_macros(stripe, fp8_pitch, direct_kv):
             offsets = S.vadd(lanes, S.vmuls(S.vshrs(lanes, 4), T.uint16(fp8_pitch - fp8_scales)))
             # One gather decodes all 16 scale bytes from each of eight rows.
             for group in T.serial(stripe // 8):
-                codes = S.vgather2(T.access_ptr(raw_fp8[group * 8, D], "r",
-                                               extent=7 * fp8_pitch + fp8_scales), offsets, full16)
+                codes = S.vgather2(T.access_ptr(raw_fp8[group * 8, D], "r", extent=7 * fp8_pitch + fp8_scales), offsets, full16)
                 bits = S.vshls(S.vmins(codes, T.uint16(224)), 7)
                 S.vsts(scale_ub[group * 128], T.reinterpret(bits, "bfloat16x128"), full16, "NORM_B16")
             S.mem_bar("VST_VLD")
@@ -152,8 +157,7 @@ def _kv_dequantization_macros(stripe, fp8_pitch, direct_kv):
             offsets = S.vadd(lanes, S.vmuls(S.vshrs(lanes, 5), T.uint16(fp8_pitch - fp4_scales)))
             high_bits = S.vdup(T.uint32(0xFFFF0000), "uint32", full32)
             for group in T.serial(stripe // 4):
-                codes = S.vgather2(T.access_ptr(raw[group * 4, D // 2], "r",
-                                               extent=3 * fp8_pitch + fp4_scales), offsets, full16)
+                codes = S.vgather2(T.access_ptr(raw[group * 4, D // 2], "r", extent=3 * fp8_pitch + fp4_scales), offsets, full16)
                 packed = T.reinterpret(codes, "float8_e4m3fnx256")
                 even = S.vcvt(packed, "float32", full16, part=0)
                 odd = S.vcvt(packed, "float32", full16, part=2)
@@ -194,10 +198,25 @@ def _kv_dequantization_macros(stripe, fp8_pitch, direct_kv):
     return dequantize_fp8, dequantize_fp4
 
 
-def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
-                        extra_width=528, extra_topk=0, softmax_scale=SM_SCALE, cores=28,
-                        kv_split=1, full_length=False, kv_pipeline=False, balance_rows=False,
-                        packed_lookahead=False, packed_pair_dma=False):
+def build_decode_kernel(
+    batch,
+    nc,
+    page_size,
+    width,
+    *,
+    ne=0,
+    extra_page_size=2,
+    extra_width=528,
+    extra_topk=0,
+    softmax_scale=SM_SCALE,
+    cores=28,
+    kv_split=1,
+    full_length=False,
+    kv_pipeline=False,
+    balance_rows=False,
+    packed_lookahead=False,
+    packed_pair_dma=False,
+):
     """Build mixed blocks over query rows or disjoint slices of their KV tiles.
 
     Opt in to paired DMA for the long packed schedule when comparing gather
@@ -225,7 +244,9 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
     import tilelang.ascend.language as T
     from tilelang.ascend.language import simd as S
     from tilelang.layout import (
-        make_ascend_compact_nz_layout, make_ascend_l0c_layout, make_ascend_major_k_layout,
+        make_ascend_compact_nz_layout,
+        make_ascend_l0c_layout,
+        make_ascend_major_k_layout,
     )
 
     packed_tile = bool(extra_topk) and kv_split == 1
@@ -239,10 +260,14 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
     short_stream = stream_tiles and _short_single_cache_stream(batch, width, extra_topk, cores)
     stream = (stream_tiles or stream_packed) and not short_stream
     # Target long, dynamic FP4 work with one or two queries per core.
-    packed_staged = (packed_lookahead and balance_rows and cores < batch < 2 * cores
-                     and extra_width == 288 and min(width, extra_topk) >= 8 * KV_TILE_ROWS)
-    packed_halves = ((width + BLOCK_K - 1) // BLOCK_K
-                     + ((extra_topk + BLOCK_K - 1) // BLOCK_K if extra_topk else 0))
+    packed_staged = (
+        packed_lookahead
+        and balance_rows
+        and cores < batch < 2 * cores
+        and extra_width == 288
+        and min(width, extra_topk) >= 8 * KV_TILE_ROWS
+    )
+    packed_halves = (width + BLOCK_K - 1) // BLOCK_K + ((extra_topk + BLOCK_K - 1) // BLOCK_K if extra_topk else 0)
     tiles_per_query = (width + block - 1) // block
     steps_per_query = (packed_halves + 1) // 2 if stream_packed else tiles_per_query
     q_slots, q_half, q_flag = 3, D // 2, 5
@@ -264,8 +289,9 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
     # Preserve per-record DMA in the long-query and two-tile schedules.
     long_query_stream = stream_tiles and _long_single_cache_stream(batch, width, extra_topk, cores)
     pair_dma = kv_pipeline and not (long_query_stream or short_stream) and tokens * fp8_bytes <= invalid_offset
-    packed_pair_dma = (packed_pair_dma and packed_staged and tokens * fp8_bytes <= invalid_offset
-                       and extra_tokens * extra_width <= invalid_offset)
+    packed_pair_dma = (
+        packed_pair_dma and packed_staged and tokens * fp8_bytes <= invalid_offset and extra_tokens * extra_width <= invalid_offset
+    )
 
     fp4_scales = D // 16
 
@@ -280,22 +306,21 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 T.copy(Cache[T.cast(index, "int64"), :], raw[j, :record_bytes])
 
     @T.macro
-    def prepare_indices(Indices, row, local_tile, n, rows, index_ub, valid, index_width, cache_tokens,
-                        pair_offsets=None):
+    def prepare_indices(Indices, row, local_tile, n, rows, index_ub, valid, index_width, cache_tokens, pair_offsets=None):
         start = local_tile * block
         if index_width % block == 0:
-            T.copy(Indices[row, start:start + block], index_ub)
+            T.copy(Indices[row, start : start + block], index_ub)
         else:
             tail = index_width % block
             if start + block <= index_width:
-                T.copy(Indices[row, start:start + block], index_ub)
+                T.copy(Indices[row, start : start + block], index_ub)
             else:
                 with T.SimdVF():
                     full = S.pset(32, "PAT_ALL")
                     zero = S.vdup(T.int32(0), "int32", full)
                     for chunk in T.serial(block // BLOCK_K):
                         S.vsts(index_ub[chunk * BLOCK_K], zero, full)
-                T.copy(Indices[row, start:start + tail], index_ub[:tail])
+                T.copy(Indices[row, start : start + tail], index_ub[:tail])
         with T.SimdVF():
             full = S.pset(32, "PAT_ALL")
             one = S.vdup(T.int32(1), "int32", full)
@@ -330,9 +355,8 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             base = offsets[0, col]
             if base != invalid_offset:
                 stride = T.alloc_var("int64", init=T.cast(offsets[1, col], "int64"))
-                records = T.StridedTensor((tokens * fp8_bytes, 2, fp8_bytes), (1, stride, 1),
-                                          "uint8", data=Cache.data)
-                T.copy(records[base, :, :], raw_fp8[2 * pair:2 * pair + 2, :fp8_bytes])
+                records = T.StridedTensor((tokens * fp8_bytes, 2, fp8_bytes), (1, stride, 1), "uint8", data=Cache.data)
+                T.copy(records[base, :, :], raw_fp8[2 * pair : 2 * pair + 2, :fp8_bytes])
 
     @T.macro
     def load_packed_pairs(Cache, offsets, raw, first, cache_tokens, record_bytes):
@@ -341,14 +365,12 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             base = T.cast(offsets[0, col], "int64")
             stride = T.alloc_var("int64", init=T.cast(offsets[1, col], "int64"))
             if stride > 0:
-                records = T.StridedTensor((cache_tokens * record_bytes, 2, record_bytes), (1, stride, 1),
-                                          "uint8", data=Cache.data)
-                T.copy(records[base, :, :], raw[2 * pair:2 * pair + 2, :record_bytes])
+                records = T.StridedTensor((cache_tokens * record_bytes, 2, record_bytes), (1, stride, 1), "uint8", data=Cache.data)
+                T.copy(records[base, :, :], raw[2 * pair : 2 * pair + 2, :record_bytes])
             elif base != invalid_offset:
                 # Zero is a repeated address. Negative codes identify the
                 # valid lane so the record reaches its original slot.
-                record = T.StridedTensor((cache_tokens * record_bytes, record_bytes), (1, 1),
-                                         "uint8", data=Cache.data)
+                record = T.StridedTensor((cache_tokens * record_bytes, record_bytes), (1, 1), "uint8", data=Cache.data)
                 if stride != -2:
                     T.copy(record[base, :], raw[2 * pair, :record_bytes])
                 if stride != -1:
@@ -358,8 +380,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
     def gather_fp8_to_l1(Cache, n, sid, index_ub, valid, raw_fp8, scale_ub, nd, kv_l1, pair_offsets):
         # Raw slots cover the DMA-to-dequantization distance. The NZ store
         # follows dequantization by one stripe and needs two ND slots.
-        for group in T.Pipelined(block // (2 * stripe), num_stages=raw_lead + 2,
-                                 annotations={"enable_offset": True}):
+        for group in T.Pipelined(block // (2 * stripe), num_stages=raw_lead + 2, annotations={"enable_offset": True}):
             # Alternate stripes across AIVs so a short prefix does not land
             # entirely on one subblock. Preserve their logical L1 row offsets.
             first = (2 * group + sid) * stripe
@@ -371,11 +392,28 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             with T.Stage(raw_lead):
                 dequantize_fp8(raw_fp8, scale_ub, valid, first, nd)
             with T.Stage(raw_lead + 1):
-                T.copy(nd[:stripe, :], kv_l1[first:first + stripe, :])
+                T.copy(nd[:stripe, :], kv_l1[first : first + stripe, :])
 
     @T.macro
-    def gather(Cache, Indices, row, local_tile, n, rows, bx, sid, index_ub, valid,
-               nd, raw_fp8, scale_ub, KVWorkspace, index_width, cache_tokens, record_bytes):
+    def gather(
+        Cache,
+        Indices,
+        row,
+        local_tile,
+        n,
+        rows,
+        bx,
+        sid,
+        index_ub,
+        valid,
+        nd,
+        raw_fp8,
+        scale_ub,
+        KVWorkspace,
+        index_width,
+        cache_tokens,
+        record_bytes,
+    ):
         prepare_indices(Indices, row, local_tile, n, rows, index_ub, valid, index_width, cache_tokens)
         for group in T.serial(rows // (2 * stripe)):
             offset = group * stripe
@@ -385,18 +423,17 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 dequantize_fp8(raw_fp8, scale_ub, valid, first, nd)
             else:
                 dequantize_fp4(raw_fp8, scale_ub, valid, first, nd)
-            T.copy(nd, KVWorkspace[bx, sid, offset:offset + stripe, :])
+            T.copy(nd, KVWorkspace[bx, sid, offset : offset + stripe, :])
 
     @T.macro
-    def prepare_half(Indices, row, piece, n, half_start, index_ub, valid, index_width, cache_tokens,
-                     record_bytes, pair_offsets):
+    def prepare_half(Indices, row, piece, n, half_start, index_ub, valid, index_width, cache_tokens, record_bytes, pair_offsets):
         start = piece * BLOCK_K
         if n > 0:
             if index_width % BLOCK_K == 0 or start + BLOCK_K <= index_width:
-                T.copy(Indices[row, start:start + BLOCK_K], index_ub[half_start:half_start + BLOCK_K])
+                T.copy(Indices[row, start : start + BLOCK_K], index_ub[half_start : half_start + BLOCK_K])
             else:
                 tail = index_width % BLOCK_K
-                T.copy(Indices[row, start:start + tail], index_ub[half_start:half_start + tail])
+                T.copy(Indices[row, start : start + tail], index_ub[half_start : half_start + tail])
         with T.SimdVF():
             full = S.pset(32, "PAT_ALL")
             index = S.vld(index_ub[half_start])
@@ -425,32 +462,51 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 S.vsts(pair_offsets[1, half_start // 2], stride, pairs, extent=BLOCK_K // 2)
 
     @T.macro
-    def prepare_packed_indices(Indices, ExtraIndices, row, tile, main_length, extra_length,
-                               main_halves, rows, index_ub, valid, pair_offsets=None):
+    def prepare_packed_indices(
+        Indices, ExtraIndices, row, tile, main_length, extra_length, main_halves, rows, index_ub, valid, pair_offsets=None
+    ):
         for part in T.serial(rows // BLOCK_K):
             piece = tile * 2 + part
             if piece < main_halves:
                 n = T.min(main_length - piece * BLOCK_K, BLOCK_K)
-                prepare_half(Indices, row, piece, n, part * BLOCK_K, index_ub, valid,
-                             width, tokens, fp8_bytes, pair_offsets)
+                prepare_half(Indices, row, piece, n, part * BLOCK_K, index_ub, valid, width, tokens, fp8_bytes, pair_offsets)
             else:
                 extra_piece = piece - main_halves
                 n = T.max(T.min(extra_length - extra_piece * BLOCK_K, BLOCK_K), 0)
-                prepare_half(ExtraIndices, row, extra_piece, n, part * BLOCK_K, index_ub, valid,
-                             extra_topk, extra_tokens, extra_width, pair_offsets)
+                prepare_half(
+                    ExtraIndices, row, extra_piece, n, part * BLOCK_K, index_ub, valid, extra_topk, extra_tokens, extra_width, pair_offsets
+                )
 
     @T.macro
-    def gather_packed(Cache, Extra, Indices, ExtraIndices, row, tile, main_length, extra_length,
-                      main_halves, rows, sid, index_ub, valid, raw, scale_ub, nd, kv_l1,
-                      prepare=True, pair_offsets=None):
+    def gather_packed(
+        Cache,
+        Extra,
+        Indices,
+        ExtraIndices,
+        row,
+        tile,
+        main_length,
+        extra_length,
+        main_halves,
+        rows,
+        sid,
+        index_ub,
+        valid,
+        raw,
+        scale_ub,
+        nd,
+        kv_l1,
+        prepare=True,
+        pair_offsets=None,
+    ):
         if prepare:
-            prepare_packed_indices(Indices, ExtraIndices, row, tile, main_length, extra_length,
-                                   main_halves, rows, index_ub, valid, pair_offsets)
+            prepare_packed_indices(
+                Indices, ExtraIndices, row, tile, main_length, extra_length, main_halves, rows, index_ub, valid, pair_offsets
+            )
         # Each AIV gathers half of each 64-row piece. MTE2, Vector and MTE3
         # advance on different stripes with two raw slots and two BF16 slots.
         # Keep static group bounds for the NZ copy and the buffer reuse flags.
-        for group in T.Pipelined(KV_TILE_ROWS // (2 * stripe), num_stages=3,
-                                 annotations={"enable_offset": True}):
+        for group in T.Pipelined(KV_TILE_ROWS // (2 * stripe), num_stages=3, annotations={"enable_offset": True}):
             part = group // (BLOCK_K // (2 * stripe))
             piece = tile * 2 + part
             from_main = piece < main_halves
@@ -479,7 +535,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                         dequantize_fp4(raw, scale_ub, valid, first, nd)
             with T.Stage(2):
                 if active:
-                    T.copy(nd[:stripe, :], kv_l1[first:first + stripe, :])
+                    T.copy(nd[:stripe, :], kv_l1[first : first + stripe, :])
 
     @T.macro
     def prefetch_query(Q, row, q_l1, q_slot):
@@ -487,15 +543,14 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             slot = (q_slot + q_part) % q_slots
             with T.Task():
                 T.ascend_wait_flag("MTE1_MTE2", q_flag + slot)
-                T.copy(Q[row * H:(row + 1) * H, q_part * q_half:(q_part + 1) * q_half],
-                       q_l1[slot, :, :])
+                T.copy(Q[row * H : (row + 1) * H, q_part * q_half : (q_part + 1) * q_half], q_l1[slot, :, :])
                 T.ascend_set_flag("MTE2_MTE1", q_flag + slot)
 
     @T.macro
     def qk(q_l1, kv_l1, qa, kb, scores, score_ub, rows, q_slot=None, local_tile=0, steps=None):
         for part in T.serial(D // FRAG_D):
             if q_slot is None:
-                T.copy(q_l1[:, part * FRAG_D:(part + 1) * FRAG_D], qa)
+                T.copy(q_l1[:, part * FRAG_D : (part + 1) * FRAG_D], qa)
             else:
                 panels = q_half // FRAG_D
                 slot = (q_slot + part // panels) % q_slots
@@ -503,17 +558,16 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 with T.Task():
                     if (local_tile == 0) & (part % panels == 0):
                         T.ascend_wait_flag("MTE2_MTE1", q_flag + slot)
-                    T.copy(q_l1[slot, :, column:column + FRAG_D], qa)
+                    T.copy(q_l1[slot, :, column : column + FRAG_D], qa)
                     last = tiles_per_query if steps is None else steps
                     if (local_tile == last - 1) & (part % panels == panels - 1):
                         T.ascend_set_flag("MTE1_MTE2", q_flag + slot)
-            T.copy(kv_l1[:rows, part * FRAG_D:(part + 1) * FRAG_D], kb[:rows, :])
+            T.copy(kv_l1[:rows, part * FRAG_D : (part + 1) * FRAG_D], kb[:rows, :])
             T.gemm(qa, kb[:rows, :], scores[:, :rows], transpose_B=True, clear_accum=(part == 0))
         T.dual_copy(scores[:, :rows], score_ub[:, :rows])
 
     @T.macro
-    def softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, rows,
-                result_state=None):
+    def softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, rows, result_state=None):
         raw = T.Tensor((pitch * block,), "bfloat16", prob_ub.data, scope="shared.dyn")
         with T.SimdVF():
             full = S.pset(32, "PAT_ALL")
@@ -546,13 +600,10 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             infinite_sink = S.vcmps(sink_value, T.infinity("float32"), heads, "eq")
             output_m = S.vmax(new_m, sink_value, heads)
             old_output_m = S.vmax(old_m, sink_value, heads)
-            degenerate = S.por(infinite_sink,
-                               S.vcmps(output_m, -T.infinity("float32"), heads, "eq"), heads)
+            degenerate = S.por(infinite_sink, S.vcmps(output_m, -T.infinity("float32"), heads, "eq"), heads)
             output_origin = S.vsel(zero, output_m, degenerate)
-            output_alpha = S.vsel(
-                one, S.vexp(S.vsub(old_output_m, output_origin, heads), heads), degenerate)
-            output_scale = S.vsel(
-                zero, S.vexp(S.vsub(new_m, output_origin, heads), heads), infinite_sink)
+            output_alpha = S.vsel(one, S.vexp(S.vsub(old_output_m, output_origin, heads), heads), degenerate)
+            output_scale = S.vsel(zero, S.vexp(S.vsub(new_m, output_origin, heads), heads), infinite_sink)
             S.vsts(p_scale[0], output_scale, heads)
             S.vsts(m[0], new_m, full)
             S.vsts(alpha[0], output_alpha, heads)
@@ -593,9 +644,8 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
     @T.macro
     def pv_fragment(kv_l1, p_l1, pa, vb, product_parts, rows, part):
         T.copy(p_l1[:, :rows], pa[:, :rows])
-        T.copy(kv_l1[:rows, part * FRAG_D:(part + 1) * FRAG_D], vb[:, :rows], transpose=True)
-        T.gemm(pa[:, :rows], vb[:, :rows], product_parts[0 if stream else part, :, :],
-               transpose_B=True, clear_accum=True)
+        T.copy(kv_l1[:rows, part * FRAG_D : (part + 1) * FRAG_D], vb[:, :rows], transpose=True)
+        T.gemm(pa[:, :rows], vb[:, :rows], product_parts[0 if stream else part, :, :], transpose_B=True, clear_accum=True)
 
     @T.macro
     def pv(kv_l1, p_l1, pa, vb, product_parts, rows):
@@ -678,16 +728,15 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
         if stream:
             for part in T.Pipelined(D // FRAG_D, num_stages=2, annotations={"enable_offset": True}):
                 first = part * FRAG_D
-                with T.Stage(0):
-                    with T.SimdVF():
-                        full = S.pset(32, "PAT_ALL")
-                        normalize_output(accum, out_ub, inv_ub, first, full, part % 2)
+                with T.Stage(0), T.SimdVF():
+                    full = S.pset(32, "PAT_ALL")
+                    normalize_output(accum, out_ub, inv_ub, first, full, part % 2)
                 with T.Stage(1):
                     head = row * H + sid * half
-                    T.copy(out_ub[part % 2, :, :], O[head:head + half, first:first + FRAG_D])
+                    T.copy(out_ub[part % 2, :, :], O[head : head + half, first : first + FRAG_D])
         else:
-            T.dual_copy(out_ub, O[row * H:(row + 1) * H, :])
-        T.dual_copy(lse_ub, LSE[row * H:(row + 1) * H])
+            T.dual_copy(out_ub, O[row * H : (row + 1) * H, :])
+        T.dual_copy(lse_ub, LSE[row * H : (row + 1) * H])
 
     @T.macro
     def row_work(Lengths, ExtraLengths, row):
@@ -708,8 +757,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
         pairs = T.alloc_var("int32", init=0)
         next_row = T.alloc_var("int32", init=0)
         for row in T.serial(batch - 1):
-            if (row == next_row) & (work[row] + work[row + 1] <= work_limit) & (
-                    payload[row] + payload[row + 1] <= byte_limit):
+            if (row == next_row) & (work[row] + work[row + 1] <= work_limit) & (payload[row] + payload[row + 1] <= byte_limit):
                 pairs = pairs + 1
                 next_row = row + 2
             else:
@@ -739,7 +787,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 upper = T.max(upper, work[row])
                 byte_limit = T.max(byte_limit, payload[row])
         old_peak = upper + 0
-        for step in T.serial((2 * packed_halves).bit_length()):
+        for _step in T.serial((2 * packed_halves).bit_length()):
             if lower < upper:
                 limit = lower + (upper - lower) // 2
                 if count_row_pairs(work, payload, limit, byte_limit) >= pairs_needed:
@@ -753,11 +801,14 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             for row in T.serial(batch):
                 if (row == next_row) & (assigned <= bx):
                     size = T.alloc_var("int32", init=1)
-                    if (pair_budget > 0) & (row + 1 < batch):
-                        if (work[row] + work[row + 1] <= upper) & (
-                                payload[row] + payload[row + 1] <= byte_limit):
-                            size = 2
-                            pair_budget = pair_budget - 1
+                    if (
+                        (pair_budget > 0)
+                        & (row + 1 < batch)
+                        & (work[row] + work[row + 1] <= upper)
+                        & (payload[row] + payload[row + 1] <= byte_limit)
+                    ):
+                        size = 2
+                        pair_budget = pair_budget - 1
                     if assigned == bx:
                         row_range[0] = row
                         row_range[1] = size
@@ -791,17 +842,19 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 cut[0] = row + 1
 
     @T.prim_func
-    def main(Q: T.Tensor((batch * H, D), "bfloat16"),
-             Cache: T.Tensor((tokens, 528), "uint8"),
-             Indices: T.Tensor((batch, width), "int32"),
-             Lengths: T.Tensor((batch,), "int32"),
-             Extra: T.Tensor((extra_tokens, extra_width), "uint8"),
-             ExtraIndices: T.Tensor((batch, max(extra_topk, 1)), "int32"),
-             ExtraLengths: T.Tensor((batch,), "int32"),
-             Sink: T.Tensor((H,), "float32"),
-             O: T.Tensor((output_rows, D), output_dtype),
-             KVWorkspace: T.Tensor(workspace_shape, "bfloat16"),
-             LSE: T.Tensor((output_rows,), "float32")):
+    def main(
+        Q: T.Tensor((batch * H, D), "bfloat16"),
+        Cache: T.Tensor((tokens, 528), "uint8"),
+        Indices: T.Tensor((batch, width), "int32"),
+        Lengths: T.Tensor((batch,), "int32"),
+        Extra: T.Tensor((extra_tokens, extra_width), "uint8"),
+        ExtraIndices: T.Tensor((batch, max(extra_topk, 1)), "int32"),
+        ExtraLengths: T.Tensor((batch,), "int32"),
+        Sink: T.Tensor((H,), "float32"),
+        O: T.Tensor((output_rows, D), output_dtype),
+        KVWorkspace: T.Tensor(workspace_shape, "bfloat16"),
+        LSE: T.Tensor((output_rows,), "float32"),
+    ):
         with T.MixedKernel(grid, sids=2) as (bx, sid):
             if stream:
                 q_l1 = T.alloc_l1((q_slots, H, q_half), "bfloat16")
@@ -819,8 +872,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 T.annotate_layout({product: make_ascend_l0c_layout(product)})
             nd = T.alloc_shared((kv_pitch, D), "bfloat16")
             raw_fp8 = T.alloc_shared((stripe, fp8_pitch), "uint8")
-            scale_ub = T.alloc_shared((stripe * (fp4_scales if extra_topk and extra_width == 288 else fp8_scales),),
-                                      "bfloat16")
+            scale_ub = T.alloc_shared((stripe * (fp4_scales if extra_topk and extra_width == 288 else fp8_scales),), "bfloat16")
             index_ub = T.alloc_shared((block,), "int32")
             valid = T.alloc_shared((block,), "int32")
             pair_offsets = T.alloc_shared((2, block // 2), "int32") if pair_dma or packed_pair_dma else None
@@ -858,25 +910,40 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                     T.annotate_buffer_versions({pair_offsets: (2, "iteration")})
                 # P, rescaling and the final stats stay live through delayed PV.
                 # The FP32 product only needs two fragment-sized UB slots.
-                T.annotate_buffer_versions({kv_l1: (3, "iteration"), valid: (3, "iteration"),
-                                            score_ub: (2, "iteration"), prob_ub: (2, "iteration"),
-                                            p_l1: (2, "iteration"), alpha: (2, "iteration"),
-                                            final_m: (2, "iteration"), final_ell: (2, "iteration"),
-                                            product_parts: (2, "iteration"), product_ub: (2, "iteration")})
+                T.annotate_buffer_versions(
+                    {
+                        kv_l1: (3, "iteration"),
+                        valid: (3, "iteration"),
+                        score_ub: (2, "iteration"),
+                        prob_ub: (2, "iteration"),
+                        p_l1: (2, "iteration"),
+                        alpha: (2, "iteration"),
+                        final_m: (2, "iteration"),
+                        final_ell: (2, "iteration"),
+                        product_parts: (2, "iteration"),
+                        product_ub: (2, "iteration"),
+                    }
+                )
             if packed_staged:
                 # KV stays live from QK through PV, and the validity mask is
                 # produced one stage earlier for gather and softmax.
-                T.annotate_buffer_versions({
-                    (pair_offsets if packed_pair_dma else index_ub): (2, "iteration"),
-                    valid: (3, "iteration"), kv_l1: (3, "iteration"), score_ub: (2, "iteration"),
-                    prob_ub: (2, "iteration"), p_l1: (2, "iteration"), alpha: (2, "iteration"),
-                    final_m: (2, "iteration"), final_ell: (2, "iteration"),
-                })
+                T.annotate_buffer_versions(
+                    {
+                        (pair_offsets if packed_pair_dma else index_ub): (2, "iteration"),
+                        valid: (3, "iteration"),
+                        kv_l1: (3, "iteration"),
+                        score_ub: (2, "iteration"),
+                        prob_ub: (2, "iteration"),
+                        p_l1: (2, "iteration"),
+                        alpha: (2, "iteration"),
+                        final_m: (2, "iteration"),
+                        final_ell: (2, "iteration"),
+                    }
+                )
             elif short_stream or packed_lookahead:
                 T.annotate_buffer_versions({kv_l1: (2, "iteration"), valid: (2, "iteration")})
             if direct_kv:
-                T.annotate_layout({nd: make_ascend_compact_nz_layout(nd),
-                                   kv_l1: make_ascend_major_k_layout(kv_l1)})
+                T.annotate_layout({nd: make_ascend_compact_nz_layout(nd), kv_l1: make_ascend_major_k_layout(kv_l1)})
                 T.annotate_buffer_versions({raw_fp8: (raw_lead + 1, "iteration"), nd: (2, "iteration")})
             with T.SimdVF():
                 full = S.pset(32, "PAT_ALL")
@@ -884,7 +951,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 S.vsts(sink[0], S.vdup(sink_init, "float32", full), full)
                 T.fill(raw_fp8, 0)
             if kv_split == 1:
-                T.copy(Sink[sid * half:(sid + 1) * half], sink[:half])
+                T.copy(Sink[sid * half : (sid + 1) * half], sink[:half])
             per = tasks // grid
             remainder = tasks % grid
             if balance_rows and grid < batch < 2 * grid:
@@ -917,8 +984,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                 with T.Stage(0):
                     for slot in T.serial(q_slots):
                         T.ascend_set_flag("MTE1_MTE2", q_flag + slot)
-                for stream_tile in T.Pipelined(count * steps_per_query, num_stages=4,
-                                              annotations={"enable_offset": True}):
+                for stream_tile in T.Pipelined(count * steps_per_query, num_stages=4, annotations={"enable_offset": True}):
                     T.assume_no_conflict(q_l1)
                     query = stream_tile // steps_per_query
                     row = start + query
@@ -931,32 +997,43 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                         n = block if full_tiles else T.min(width - local_tile * block, block)
                     with T.Stage(0):
                         if not stream_packed:
-                            prepare_indices(Indices, row, local_tile, n, block, index_ub, valid,
-                                            width, tokens, pair_offsets)
+                            prepare_indices(Indices, row, local_tile, n, block, index_ub, valid, width, tokens, pair_offsets)
                     with T.Stage(1):
                         if local_tile == 0:
                             prefetch_query(Q, row, q_l1, q_slot)
                         if stream_packed:
                             # Odd tails pad the second half with masked rows.
-                            gather_packed(Cache, Extra, Indices, ExtraIndices, row, local_tile,
-                                          width, extra_topk, main_halves, block, sid, index_ub,
-                                          valid, raw_fp8, scale_ub, nd, kv_l1)
+                            gather_packed(
+                                Cache,
+                                Extra,
+                                Indices,
+                                ExtraIndices,
+                                row,
+                                local_tile,
+                                width,
+                                extra_topk,
+                                main_halves,
+                                block,
+                                sid,
+                                index_ub,
+                                valid,
+                                raw_fp8,
+                                scale_ub,
+                                nd,
+                                kv_l1,
+                            )
                         else:
-                            gather_fp8_to_l1(Cache, n, sid, index_ub, valid, raw_fp8, scale_ub, nd,
-                                             kv_l1, pair_offsets)
+                            gather_fp8_to_l1(Cache, n, sid, index_ub, valid, raw_fp8, scale_ub, nd, kv_l1, pair_offsets)
                     with T.Stage(2):
-                        qk(q_l1, kv_l1, qa, kb, scores, score_ub, block, q_slot, local_tile,
-                           steps_per_query)
+                        qk(q_l1, kv_l1, qa, kb, scores, score_ub, block, q_slot, local_tile, steps_per_query)
                         if local_tile == 0:
                             with T.SimdVF():
                                 full = S.pset(32, "PAT_ALL")
                                 S.vsts(m[0], S.vdup(-T.infinity("float32"), "float32", full), full)
                                 S.vsts(ell[0], S.vdup(T.float32(0), "float32", full), full)
-                        softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, block,
-                                (final_m, final_ell))
+                        softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, block, (final_m, final_ell))
                     with T.Stage(3):
-                        stream_pv(local_tile, kv_l1, p_l1, qa, vb, product_parts, product_ub, accum,
-                                  alpha, block)
+                        stream_pv(local_tile, kv_l1, p_l1, qa, vb, product_parts, product_ub, accum, alpha, block)
                         if local_tile + 1 == steps_per_query:
                             finish(row, O, LSE, accum, out_ub, final_m, final_ell, sink, lse_ub, inv_ub, sid)
                 with T.Stage(0):
@@ -965,8 +1042,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             elif short_stream:
                 # Keep one query's state in the consumer while the producer
                 # fills the other KV slot, including across query boundaries.
-                for stream_tile in T.Pipelined(count * steps_per_query, num_stages=2,
-                                              annotations={"enable_offset": True}):
+                for stream_tile in T.Pipelined(count * steps_per_query, num_stages=2, annotations={"enable_offset": True}):
                     row = start + stream_tile // steps_per_query
                     local_tile = stream_tile % steps_per_query
                     with T.Stage(0):
@@ -974,7 +1050,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                         gather_fp8_to_l1(Cache, block, sid, index_ub, valid, raw_fp8, scale_ub, nd, kv_l1, None)
                     with T.Stage(1):
                         if local_tile == 0:
-                            T.copy(Q[row * H:(row + 1) * H, :], q_l1)
+                            T.copy(Q[row * H : (row + 1) * H, :], q_l1)
                             with T.SimdVF():
                                 full = S.pset(32, "PAT_ALL")
                                 S.vsts(m[0], S.vdup(-T.infinity("float32"), "float32", full), full)
@@ -988,7 +1064,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                             finish(row, O, LSE, accum, out_ub, m, ell, sink, lse_ub, inv_ub)
             elif packed_staged:
                 for row in T.serial(start, start + count):
-                    T.copy(Q[row * H:(row + 1) * H, :], q_l1)
+                    T.copy(Q[row * H : (row + 1) * H, :], q_l1)
                     with T.SimdVF():
                         full = S.pset(32, "PAT_ALL")
                         S.vsts(m[0], S.vdup(-T.infinity("float32"), "float32", full), full)
@@ -999,7 +1075,8 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                     half_count = main_halves + T.ceildiv(extra_length, BLOCK_K)
                     iterations = T.max(T.ceildiv(half_count, 2), 1)
                     for tile in T.Pipelined(
-                        iterations, num_stages=4,
+                        iterations,
+                        num_stages=4,
                         annotations={
                             "enable_offset": True,
                             "multi_buffer_eligible": [pair_offsets if packed_pair_dma else index_ub, valid, kv_l1],
@@ -1007,23 +1084,50 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                     ):
                         rows = T.if_then_else(tile * 2 + 1 < half_count, block, BLOCK_K)
                         with T.Stage(0):
-                            prepare_packed_indices(Indices, ExtraIndices, row, tile, main_length, extra_length,
-                                                   main_halves, rows, index_ub, valid, pair_offsets)
+                            prepare_packed_indices(
+                                Indices,
+                                ExtraIndices,
+                                row,
+                                tile,
+                                main_length,
+                                extra_length,
+                                main_halves,
+                                rows,
+                                index_ub,
+                                valid,
+                                pair_offsets,
+                            )
                         with T.Stage(1):
-                            gather_packed(Cache, Extra, Indices, ExtraIndices, row, tile, main_length, extra_length,
-                                          main_halves, rows, sid, index_ub, valid, raw_fp8, scale_ub, nd, kv_l1,
-                                          prepare=False, pair_offsets=pair_offsets)
+                            gather_packed(
+                                Cache,
+                                Extra,
+                                Indices,
+                                ExtraIndices,
+                                row,
+                                tile,
+                                main_length,
+                                extra_length,
+                                main_halves,
+                                rows,
+                                sid,
+                                index_ub,
+                                valid,
+                                raw_fp8,
+                                scale_ub,
+                                nd,
+                                kv_l1,
+                                prepare=False,
+                                pair_offsets=pair_offsets,
+                            )
                             if rows == BLOCK_K:
                                 qk(q_l1, kv_l1, qa, kb, scores, score_ub, BLOCK_K)
                             else:
                                 qk(q_l1, kv_l1, qa, kb, scores, score_ub, block)
                         with T.Stage(2):
                             if rows == BLOCK_K:
-                                softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale,
-                                        BLOCK_K, (final_m, final_ell))
+                                softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, BLOCK_K, (final_m, final_ell))
                             else:
-                                softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale,
-                                        block, (final_m, final_ell))
+                                softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, block, (final_m, final_ell))
                         with T.Stage(3):
                             if rows == BLOCK_K:
                                 pv(kv_l1, p_l1, qa, vb, product_parts, BLOCK_K)
@@ -1036,7 +1140,7 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
             else:
                 for task in T.serial(start, start + count):
                     row = task // kv_split if kv_split > 1 else task
-                    T.copy(Q[row * H:(row + 1) * H, :], q_l1)
+                    T.copy(Q[row * H : (row + 1) * H, :], q_l1)
                     with T.SimdVF():
                         full = S.pset(32, "PAT_ALL")
                         S.vsts(m[0], S.vdup(-T.infinity("float32"), "float32", full), full)
@@ -1066,15 +1170,35 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                             iterations = piece_tiles if full_length else T.max(piece_tiles, 1)
                         else:
                             iterations = tile_count
-                    for tile in (T.Pipelined(iterations, num_stages=2, annotations={"enable_offset": True})
-                                 if packed_lookahead else T.serial(iterations)):
+                    for tile in (
+                        T.Pipelined(iterations, num_stages=2, annotations={"enable_offset": True})
+                        if packed_lookahead
+                        else T.serial(iterations)
+                    ):
                         if packed_tile:
                             # A lone half tile fits in the first 64 L1 rows. An
                             # empty row also needs one masked half to initialize PV.
                             n = T.if_then_else(tile * 2 + 1 < half_count, block, BLOCK_K)
                             with T.Stage(0) if packed_lookahead else nullcontext():
-                                gather_packed(Cache, Extra, Indices, ExtraIndices, row, tile, main_length, extra_length,
-                                              main_halves, n, sid, index_ub, valid, raw_fp8, scale_ub, nd, kv_l1)
+                                gather_packed(
+                                    Cache,
+                                    Extra,
+                                    Indices,
+                                    ExtraIndices,
+                                    row,
+                                    tile,
+                                    main_length,
+                                    extra_length,
+                                    main_halves,
+                                    n,
+                                    sid,
+                                    index_ub,
+                                    valid,
+                                    raw_fp8,
+                                    scale_ub,
+                                    nd,
+                                    kv_l1,
+                                )
                         else:
                             if kv_split > 1:
                                 global_tile = begin + tile if full_length else T.min(begin + tile, tile_count - 1)
@@ -1094,30 +1218,62 @@ def build_decode_kernel(batch, nc, page_size, width, *, ne=0, extra_page_size=2,
                             rows = block if kv_pipeline or block == BLOCK_K else T.if_then_else(n <= BLOCK_K, BLOCK_K, block)
                             if kv_pipeline:
                                 # Fixed L1 offsets also cover a masked final tile.
-                                prepare_indices(Indices, row, global_tile, n, block,
-                                                index_ub, valid, width, tokens, pair_offsets)
-                                gather_fp8_to_l1(Cache, n, sid, index_ub, valid, raw_fp8, scale_ub, nd,
-                                                kv_l1, pair_offsets)
+                                prepare_indices(Indices, row, global_tile, n, block, index_ub, valid, width, tokens, pair_offsets)
+                                gather_fp8_to_l1(Cache, n, sid, index_ub, valid, raw_fp8, scale_ub, nd, kv_l1, pair_offsets)
                             elif not extra_topk or from_main:
-                                gather(Cache, Indices, row, global_tile, n, rows, bx, sid, index_ub, valid,
-                                       nd, raw_fp8, scale_ub, KVWorkspace, width, tokens, fp8_bytes)
+                                gather(
+                                    Cache,
+                                    Indices,
+                                    row,
+                                    global_tile,
+                                    n,
+                                    rows,
+                                    bx,
+                                    sid,
+                                    index_ub,
+                                    valid,
+                                    nd,
+                                    raw_fp8,
+                                    scale_ub,
+                                    KVWorkspace,
+                                    width,
+                                    tokens,
+                                    fp8_bytes,
+                                )
                             else:
-                                gather(Extra, ExtraIndices, row, extra_tile, n, rows, bx, sid, index_ub, valid,
-                                       nd, raw_fp8, scale_ub, KVWorkspace, extra_topk, extra_tokens, extra_width)
+                                gather(
+                                    Extra,
+                                    ExtraIndices,
+                                    row,
+                                    extra_tile,
+                                    n,
+                                    rows,
+                                    bx,
+                                    sid,
+                                    index_ub,
+                                    valid,
+                                    nd,
+                                    raw_fp8,
+                                    scale_ub,
+                                    KVWorkspace,
+                                    extra_topk,
+                                    extra_tokens,
+                                    extra_width,
+                                )
                         # One KV slot feeds Cube while the other is gathered by AIV.
                         # Keep the online softmax and PV recurrence in one stage.
                         with T.Stage(1) if packed_lookahead else nullcontext():
                             if block == BLOCK_K or (not kv_pipeline and n <= BLOCK_K):
                                 if not direct_kv:
-                                    T.copy(KVWorkspace[bx, 0, :BLOCK_K // 2, :], kv_l1[:BLOCK_K // 2, :])
-                                    T.copy(KVWorkspace[bx, 1, :BLOCK_K // 2, :], kv_l1[BLOCK_K // 2:BLOCK_K, :])
+                                    T.copy(KVWorkspace[bx, 0, : BLOCK_K // 2, :], kv_l1[: BLOCK_K // 2, :])
+                                    T.copy(KVWorkspace[bx, 1, : BLOCK_K // 2, :], kv_l1[BLOCK_K // 2 : BLOCK_K, :])
                                 qk(q_l1, kv_l1, qa, kb, scores, score_ub, BLOCK_K)
                                 softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, BLOCK_K)
                                 pv(kv_l1, p_l1, qa, vb, product_parts, BLOCK_K)
                             else:
                                 if not direct_kv:
-                                    T.copy(KVWorkspace[bx, 0, :, :], kv_l1[:block // 2, :])
-                                    T.copy(KVWorkspace[bx, 1, :, :], kv_l1[block // 2:, :])
+                                    T.copy(KVWorkspace[bx, 0, :, :], kv_l1[: block // 2, :])
+                                    T.copy(KVWorkspace[bx, 1, :, :], kv_l1[block // 2 :, :])
                                 qk(q_l1, kv_l1, qa, kb, scores, score_ub, block)
                                 softmax(score_ub, valid, prob_ub, p_l1, m, ell, alpha, sink, stats, p_scale, block)
                                 pv(kv_l1, p_l1, qa, vb, product_parts, block)
@@ -1172,8 +1328,7 @@ def build_decode_merge_kernel(batch, split, cores):
             kv_scale = S.vsel(S.vexp(S.vsub(safe_anchor, safe_origin, mask), mask), zero, active)
             sink_weight = S.vsel(one, S.vexp(S.vsub(sink, safe_origin, mask), mask), infinite_sink)
             denominator = S.vadd(S.vmul(total, kv_scale, mask), sink_weight, mask)
-            safe_denominator = S.vsel(denominator, one,
-                                      S.vcmps(denominator, T.float32(0), mask, "gt"))
+            safe_denominator = S.vsel(denominator, one, S.vcmps(denominator, T.float32(0), mask, "gt"))
             factor = S.vdiv(kv_scale, safe_denominator, mask, precision="exact")
             for piece in T.serial(split):
                 weight = S.vexp(S.vsub(S.vld(logs[piece, 0]), safe_anchor, mask), mask)
@@ -1196,11 +1351,13 @@ def build_decode_merge_kernel(batch, split, cores):
                     S.vsts(out[head * D + col * BLOCK_K], packed, full, "PK_B32")
 
     @T.prim_func
-    def decode_merge(Partial: T.Tensor((rows * split, D), "float32"),
-             PartialLSE: T.Tensor((rows * split,), "float32"),
-             Sink: T.Tensor((H,), "float32"),
-             O: T.Tensor((rows, D), "bfloat16"),
-             LSE: T.Tensor((rows,), "float32")):
+    def decode_merge(
+        Partial: T.Tensor((rows * split, D), "float32"),
+        PartialLSE: T.Tensor((rows * split,), "float32"),
+        Sink: T.Tensor((H,), "float32"),
+        O: T.Tensor((rows, D), "bfloat16"),
+        LSE: T.Tensor((rows,), "float32"),
+    ):
         with T.Kernel(grid) as bx:
             values = T.alloc_shared((split, heads * D), "float32")
             logs = T.alloc_shared((split, BLOCK_K), "float32")
@@ -1217,31 +1374,63 @@ def build_decode_merge_kernel(batch, split, cores):
                     query = group // groups_per_query
                     head = group % groups_per_query * heads
                     row = group * heads
-                    T.copy(partial[query, :, head * D:(head + heads) * D], values)
-                    T.copy(partial_lse[query, :, head:head + heads], logs[:, :heads])
-                    T.copy(Sink[head:head + heads], sink_ub[:heads])
+                    T.copy(partial[query, :, head * D : (head + heads) * D], values)
+                    T.copy(partial_lse[query, :, head : head + heads], logs[:, :heads])
+                    T.copy(Sink[head : head + heads], sink_ub[:heads])
                     reduce_lse(logs, sink_ub, weights, lse_ub)
                     reduce_output(values, weights, out)
-                    T.copy(out, output[row * D:(row + heads) * D])
-                    T.copy(lse_ub[:heads], LSE[row:row + heads])
+                    T.copy(out, output[row * D : (row + heads) * D])
+                    T.copy(lse_ub[:heads], LSE[row : row + heads])
+
     return decode_merge
 
 
 @lru_cache(maxsize=32)
-def _compile_decode(batch, nc, p, width, ne, pe, ce, te, scale, cores, *, kv_split=1,
-                    full_length=False, kv_pipeline=False, balance_rows=False, packed_lookahead=False):
+def _compile_decode(
+    batch,
+    nc,
+    p,
+    width,
+    ne,
+    pe,
+    ce,
+    te,
+    scale,
+    cores,
+    *,
+    kv_split=1,
+    full_length=False,
+    kv_pipeline=False,
+    balance_rows=False,
+    packed_lookahead=False,
+):
     import tilelang
     from tvm.target import Target
-    program = build_decode_kernel(batch, nc, p, width, ne=ne, extra_page_size=pe,
-                                   extra_width=ce, extra_topk=te, softmax_scale=scale, cores=cores,
-                                   kv_split=kv_split, full_length=full_length, kv_pipeline=kv_pipeline,
-                                   balance_rows=balance_rows, packed_lookahead=packed_lookahead)
+
+    program = build_decode_kernel(
+        batch,
+        nc,
+        p,
+        width,
+        ne=ne,
+        extra_page_size=pe,
+        extra_width=ce,
+        extra_topk=te,
+        softmax_scale=scale,
+        cores=cores,
+        kv_split=kv_split,
+        full_length=full_length,
+        kv_pipeline=kv_pipeline,
+        balance_rows=balance_rows,
+        packed_lookahead=packed_lookahead,
+    )
     with Target("ascend") as target:
         attention = tilelang.compile(program, target=target, execution_backend="tvm_ffi", out_idx=[8, 9, 10])
         if kv_split == 1:
             return attention
-        merge = tilelang.compile(build_decode_merge_kernel(batch, kv_split, cores), target=target,
-                                 execution_backend="tvm_ffi", out_idx=[3, 4])
+        merge = tilelang.compile(
+            build_decode_merge_kernel(batch, kv_split, cores), target=target, execution_backend="tvm_ffi", out_idx=[3, 4]
+        )
 
     def run_split(*inputs):
         partial, workspace, partial_lse = attention(*inputs)
@@ -1293,8 +1482,7 @@ def _require_npu(q):
 
 def _check_cache(name, cache, device, main=False):
     min_page_size = 2 if main else 1
-    if (cache.ndim != 4 or cache.shape[0] <= 0 or cache.shape[1] < min_page_size
-            or cache.shape[2] != 1):
+    if cache.ndim != 4 or cache.shape[0] <= 0 or cache.shape[1] < min_page_size or cache.shape[2] != 1:
         shape = "[Nc,P,1,C], Nc>0, P>1" if main else "[Ne,Pe,1,C], Ne>0, Pe>=1"
         raise ValueError(f"{name} must have shape {shape}")
     allowed_widths = (528,) if main else (528, 288)
@@ -1318,7 +1506,8 @@ def _core_count(q=None):
     """Count the Cube cores on the tensor's NPU or the current NPU."""
     if not hasattr(torch, "npu"):
         try:
-            import torch_npu  # noqa: F401; registers torch.npu lazily.
+            # Importing registers torch.npu lazily.
+            import torch_npu  # noqa: F401
         except ImportError as exc:
             raise RuntimeError("Automatic core detection requires torch_npu; pass cores explicitly for offline source generation") from exc
     device = q.device if q is not None else torch.npu.current_device()
@@ -1373,12 +1562,25 @@ def _cached_constant(shape, value, dtype, device):
 
 
 def flash_mla_with_kvcache(
-    q, k_cache, block_table, cache_seqlens, head_dim_v,
-    tile_scheduler_metadata, num_splits=None, softmax_scale=None,
-    causal=False, is_fp8_kvcache=True, indices=None, attn_sink=None,
-    extra_k_cache=None, extra_indices_in_kvcache=None,
-    topk_length=None, extra_topk_length=None, enable_batch_invariant=False,
-    *, validate_values=True,
+    q,
+    k_cache,
+    block_table,
+    cache_seqlens,
+    head_dim_v,
+    tile_scheduler_metadata,
+    num_splits=None,
+    softmax_scale=None,
+    causal=False,
+    is_fp8_kvcache=True,
+    indices=None,
+    attn_sink=None,
+    extra_k_cache=None,
+    extra_indices_in_kvcache=None,
+    topk_length=None,
+    extra_topk_length=None,
+    enable_batch_invariant=False,
+    *,
+    validate_values=True,
 ):
     """[B,1,64,512] BF16 -> O[B,1,64,512], lse[B,64,1].
 
@@ -1437,8 +1639,7 @@ def flash_mla_with_kvcache(
         raise ValueError("Extra indices/lengths require extra_k_cache")
 
     if validate_values:
-        for idx, lens, tokens in ((indices, topk_length, nc * p),
-                                  (extra_indices_in_kvcache, extra_topk_length, ne * pe)):
+        for idx, lens, tokens in ((indices, topk_length, nc * p), (extra_indices_in_kvcache, extra_topk_length, ne * pe)):
             if idx is not None:
                 host_idx = idx.detach().cpu()
                 invalid = (host_idx != -1) & ((host_idx < 0) | (host_idx >= tokens))
@@ -1448,48 +1649,61 @@ def flash_mla_with_kvcache(
                 if bool(invalid.any()):
                     raise ValueError("Decode physical index must be -1 or in [0, N*P) within the valid prefix")
     _require_npu(q)
-    lengths = (_cached_constant((b,), width, torch.int32, q.device)
-               if topk_length is None else topk_length.contiguous())
-    extra_lengths = (_cached_constant((b,), te, torch.int32, q.device)
-                     if extra_topk_length is None else extra_topk_length.contiguous())
-    sink = (_cached_constant((H,), -math.inf, torch.float32, q.device)
-            if attn_sink is None else attn_sink.contiguous())
+    lengths = _cached_constant((b,), width, torch.int32, q.device) if topk_length is None else topk_length.contiguous()
+    extra_lengths = _cached_constant((b,), te, torch.int32, q.device) if extra_topk_length is None else extra_topk_length.contiguous()
+    sink = _cached_constant((H,), -math.inf, torch.float32, q.device) if attn_sink is None else attn_sink.contiguous()
     cache = _cached_view(
         ("cache", k_cache.data_ptr(), k_cache.shape, k_cache.stride(), k_cache.dtype),
-        lambda: k_cache.contiguous().view(torch.uint8).view(nc * p, 528))
+        lambda: k_cache.contiguous().view(torch.uint8).view(nc * p, 528),
+    )
     idx = _cached_view(
-        ("idx", indices.data_ptr(), indices.shape, indices.stride(), indices.dtype),
-        lambda: indices.contiguous().view(b, width))
-    extra = (cache[:1] if extra_k_cache is None else
-             _cached_view(
-                 ("extra", extra_k_cache.data_ptr(), extra_k_cache.shape,
-                  extra_k_cache.stride(), extra_k_cache.dtype),
-                 lambda: extra_k_cache.contiguous().view(torch.uint8).view(ne * pe, ce)))
-    extra_idx = (extra_lengths.view(b, 1) if extra_indices_in_kvcache is None else
-                 extra_indices_in_kvcache.contiguous().view(b, te))
-    config = (b, 1, H, p, 1, False, True, width, pe if ne else None, te if ne else None,
-              bool(enable_batch_invariant))
-    if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
-        if tile_scheduler_metadata.have_initialized and tile_scheduler_metadata.config != config:
-            raise ValueError("Metadata shape/config changed; create a fresh get_mla_metadata()[0]")
+        ("idx", indices.data_ptr(), indices.shape, indices.stride(), indices.dtype), lambda: indices.contiguous().view(b, width)
+    )
+    extra = (
+        cache[:1]
+        if extra_k_cache is None
+        else _cached_view(
+            ("extra", extra_k_cache.data_ptr(), extra_k_cache.shape, extra_k_cache.stride(), extra_k_cache.dtype),
+            lambda: extra_k_cache.contiguous().view(torch.uint8).view(ne * pe, ce),
+        )
+    )
+    extra_idx = extra_lengths.view(b, 1) if extra_indices_in_kvcache is None else extra_indices_in_kvcache.contiguous().view(b, te)
+    config = (b, 1, H, p, 1, False, True, width, pe if ne else None, te if ne else None, bool(enable_batch_invariant))
+    if (
+        isinstance(tile_scheduler_metadata, FlashMLASchedMeta)
+        and tile_scheduler_metadata.have_initialized
+        and tile_scheduler_metadata.config != config
+    ):
+        raise ValueError("Metadata shape/config changed; create a fresh get_mla_metadata()[0]")
     device = q.device
     if torch.npu.current_device() != device.index:
         torch.npu.set_device(device)
     cores = _cached_cores(q)
-    pipeline = _auto_kv_pipeline(b, width, te, cores, static_lengths,
-                                 enable_batch_invariant=enable_batch_invariant)
+    pipeline = _auto_kv_pipeline(b, width, te, cores, static_lengths, enable_batch_invariant=enable_batch_invariant)
     full_length = pipeline and static_lengths
     # Rebalancing needs multiple queries on at least one core and enough
     # KV work per query to amortize the length reads.
     kv_rows = width + (te + BLOCK_K - 1) // BLOCK_K * BLOCK_K
-    balance_rows = (not static_lengths and not enable_batch_invariant and 1 < cores < b
-                    and kv_rows > KV_TILE_ROWS)
+    balance_rows = not static_lengths and not enable_batch_invariant and 1 < cores < b and kv_rows > KV_TILE_ROWS
     packed_lookahead = bool(te and not static_lengths and not enable_batch_invariant and kv_rows > KV_TILE_ROWS)
-    kernel = _compile_decode(b, nc, p, width, ne, pe, ce, te, scale, cores, kv_split=1,
-                             full_length=full_length, kv_pipeline=pipeline, balance_rows=balance_rows,
-                             packed_lookahead=packed_lookahead)
-    flat_q = _cached_view(("q", q.data_ptr(), q.shape, q.stride(), q.dtype),
-                          lambda: q.contiguous().view(b * H, D))
+    kernel = _compile_decode(
+        b,
+        nc,
+        p,
+        width,
+        ne,
+        pe,
+        ce,
+        te,
+        scale,
+        cores,
+        kv_split=1,
+        full_length=full_length,
+        kv_pipeline=pipeline,
+        balance_rows=balance_rows,
+        packed_lookahead=packed_lookahead,
+    )
+    flat_q = _cached_view(("q", q.data_ptr(), q.shape, q.stride(), q.dtype), lambda: q.contiguous().view(b * H, D))
     o, _, lse = kernel(flat_q, cache, idx, lengths, extra, extra_idx, extra_lengths, sink)
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
         tile_scheduler_metadata.have_initialized = True

@@ -81,14 +81,14 @@ def _npu_device():
     return torch.device("npu", torch.npu.current_device())
 
 
-def run_prefill(seq_len=32, kv_len=4096, index_width=INDEX_TOPK, *, sink=False, attn_sink=None,
-                topk_length=None, seed=88888888, bench=True):
+def run_prefill(
+    seq_len=32, kv_len=4096, index_width=INDEX_TOPK, *, sink=False, attn_sink=None, topk_length=None, seed=88888888, bench=True
+):
     """Check the prefill kernel against the reference, then profile it."""
     q, kv, indices, _ = make_prefill_inputs(seq_len, kv_len, index_width, seed=seed)
     topk_length = make_topk_length(topk_length, seq_len, index_width)
     attn_sink = make_sink(seed, enabled=sink, weights=attn_sink)
-    expected_out, expected_max, expected_lse = reference_prefill(
-        q, kv, indices, topk_length=topk_length, attn_sink=attn_sink)
+    expected_out, expected_max, expected_lse = reference_prefill(q, kv, indices, topk_length=topk_length, attn_sink=attn_sink)
     device = _npu_device()
     q, kv, indices = (tensor.to(device) for tensor in (q, kv, indices))
     if topk_length is not None:
@@ -96,8 +96,7 @@ def run_prefill(seq_len=32, kv_len=4096, index_width=INDEX_TOPK, *, sink=False, 
     if attn_sink is not None:
         attn_sink = attn_sink.to(device)
     print(f"Prefill: Sq={seq_len}, Skv={kv_len}, T={index_width}, sink={attn_sink is not None}", flush=True)
-    out, max_logits, lse = flash_mla_sparse_fwd(q, kv, indices, SM_SCALE, attn_sink=attn_sink,
-                                                topk_length=topk_length)
+    out, max_logits, lse = flash_mla_sparse_fwd(q, kv, indices, SM_SCALE, attn_sink=attn_sink, topk_length=topk_length)
     torch.npu.synchronize()
     _check_prefill(out, max_logits, lse, expected_out, expected_max, expected_lse, seq_len)
     print("Accuracy PASS", flush=True)
@@ -105,8 +104,8 @@ def run_prefill(seq_len=32, kv_len=4096, index_width=INDEX_TOPK, *, sink=False, 
         from tilelang.profiler import do_bench
 
         call = lambda: flash_mla_sparse_fwd(  # noqa: E731
-            q, kv, indices, SM_SCALE, attn_sink=attn_sink, topk_length=topk_length,
-            validate_values=False)
+            q, kv, indices, SM_SCALE, attn_sink=attn_sink, topk_length=topk_length, validate_values=False
+        )
         profile = do_bench(call, backend="msprof_detail", _n_warmup=30, _n_repeat=100)
         flops = 4.0 * seq_len * NUM_HEADS * index_width * HEAD_DIM
         print(f"{profile.dur_us:.2f} us/iter | {profile.tflops(flops):.1f} TFLOPS", flush=True)
@@ -123,8 +122,16 @@ def main():
     parser.add_argument("--seed", type=int, default=88888888)
     parser.add_argument("--no-bench", action="store_true", help="Skip profiling")
     args = parser.parse_args()
-    run_prefill(args.seq_len, args.kv_len, args.index_width, sink=args.sink, attn_sink=load_sink(args.sink_file),
-                topk_length=args.topk_length, seed=args.seed, bench=not args.no_bench)
+    run_prefill(
+        args.seq_len,
+        args.kv_len,
+        args.index_width,
+        sink=args.sink,
+        attn_sink=load_sink(args.sink_file),
+        topk_length=args.topk_length,
+        seed=args.seed,
+        bench=not args.no_bench,
+    )
 
 
 if __name__ == "__main__":
