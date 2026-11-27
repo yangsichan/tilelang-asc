@@ -39,9 +39,10 @@ def _decode_tiles(width, extra_topk):
 
 
 def _long_single_cache_stream(batch, width, extra_topk, cores):
-    # Each query gets its own mixed block and amortizes the pipeline prologue
-    # over at least sixteen full KV tiles. The index mask handles a half tail.
-    return batch <= cores and extra_topk == 0 and width // KV_TILE_ROWS >= 16
+    # The low-batch cases have four, five or eight KV tiles. The index mask
+    # handles a half tail with the same fixed L1 tile layout.
+    small_batch_stream = batch == 2 and (4 * KV_TILE_ROWS <= width <= 5 * KV_TILE_ROWS or width == 8 * KV_TILE_ROWS)
+    return batch <= cores and extra_topk == 0 and (width // KV_TILE_ROWS >= 16 or small_batch_stream)
 
 
 def _short_single_cache_stream(batch, width, extra_topk, cores):
