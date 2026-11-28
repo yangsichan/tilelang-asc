@@ -51,9 +51,9 @@ def test_prefill_variable_lengths_and_empty_rows(device):
     q, kv, indices, lengths = (tensor.to(device) for tensor in (q, kv, indices, lengths))
     out, max_logits, lse = _prefill(q, kv, indices, lengths)
     _check_prefill(out, max_logits, lse, expected_out, expected_max, expected_lse, seq_len)
-    assert torch.count_nonzero(out[0]) == 0
-    assert bool(torch.isinf(max_logits[0]).all() and (max_logits[0] < 0).all())
-    assert bool(torch.isinf(lse[0]).all())
+    assert torch.count_nonzero(out.float().cpu()[0]) == 0
+    assert bool(torch.isneginf(max_logits.cpu()[0]).all())
+    assert bool(torch.isposinf(lse.cpu()[0]).all())
 
 
 def test_prefill_all_invalid_indices(device):

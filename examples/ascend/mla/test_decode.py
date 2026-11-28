@@ -93,8 +93,8 @@ def test_decode_variable_lengths_and_empty_rows(device):
     q, cache, indices, lengths = (tensor.to(device) for tensor in (q, cache, indices, lengths))
     out, lse = _decode(q, cache, indices, lengths)
     _check_decode(out, lse, expected_out, expected_lse, batch)
-    assert torch.count_nonzero(out[1]) == 0
-    assert bool(torch.isinf(lse[1]).all())
+    assert torch.count_nonzero(out.float().cpu()[1]) == 0
+    assert bool(torch.isposinf(lse.cpu()[1]).all())
 
 
 def test_decode_all_invalid_rows(device):
