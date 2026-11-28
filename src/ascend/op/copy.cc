@@ -479,7 +479,14 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       }
       return -1;
     };
-    int64_t rb_plan = as_int_plan(plan_row_bytes);
+    // plan_row_bytes is ceil(row_elems * elem_bits / 8). For sub-byte dtypes
+    // such as FP4 the byte count is a FloorDiv expression that is not constant
+    // folded, so derive the static byte count from the logical row extent
+    // instead of matching an IntImm directly.
+    int64_t rb_plan = as_int_plan(plan.row_elems);
+    if (rb_plan >= 0) {
+      rb_plan = (rb_plan * elem_bits + 7) / 8;
+    }
     bool data_select = dma_path == DMAPath::kGMToUB && op.data_select != 0;
     // Padding right-pads each row up to the next 32B boundary, so it needs a
     // statically-known row byte length to compute the pad count. A symbolic
