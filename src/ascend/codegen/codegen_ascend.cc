@@ -1415,6 +1415,7 @@ void CodeGenTileLangAscend::EmitGmToUbufCopy_(const CallNode *op) {
   // burstLen and stride use bytes; right_pad uses elements of the buffer dtype.
   std::string pointer_type = "uint8_t";
   const auto *right_pad = op->args[6].as<IntImmNode>();
+  PrimExpr right_pad_arg = op->args[6];
   if (right_pad && right_pad->value != 0) {
     DataType element_type = op->args[0].dtype();
     if (element_type.is_handle()) {
@@ -1424,11 +1425,18 @@ void CodeGenTileLangAscend::EmitGmToUbufCopy_(const CallNode *op) {
         }
       }
     }
-    const int bits = element_type.bits();
-    ICHECK(bits == 8 || bits == 16 || bits == 32)
-        << "Ascend padded GM->UB copy supports 8/16/32-bit elements, got "
-        << bits;
-    pointer_type = "uint" + std::to_string(bits) + "_t";
+    if (element_type.is_float4_e2m1fn()) {
+      // FP4 packs two 4-bit logical elements into one byte, so right_pad must
+      // be converted to physical bytes.
+      pointer_type = "uint8_t";
+      right_pad_arg = make_const(op->args[6].dtype(), right_pad->value / 2);
+    } else {
+      const int bits = element_type.bits();
+      ICHECK(bits == 8 || bits == 16 || bits == 32)
+          << "Ascend padded GM->UB copy supports 8/16/32-bit elements, got "
+          << bits;
+      pointer_type = "uint" + std::to_string(bits) + "_t";
+    }
   }
 
   // IR arg 2 is sid, which asc_copy_gm2ub_align does not take.
@@ -1438,7 +1446,7 @@ void CodeGenTileLangAscend::EmitGmToUbufCopy_(const CallNode *op) {
                  {op->args[3]},
                  {op->args[4]},
                  {op->args[5]},
-                 {op->args[6]},
+                 {right_pad_arg},
                  {op->args[7]},
                  {op->args[8], "static_cast<asc_load_l2_cache_mode>(", ")"},
                  {op->args[9]},
@@ -1549,14 +1557,28 @@ void CodeGenTileLangAscend::EmitL0cToGmCopy_(const CallNode *op) {
 void CodeGenTileLangAscend::EmitSetCopyPadValue_(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 1)
       << "tl.ascend_set_copy_pad_value expects exactly 1 argument";
-  const int bit_width = op->args[0].dtype().bits();
+  const DataType dtype = op->args[0].dtype();
+  // FP8/FP4 pad values are limited to the constant zero (physical byte 0x00)
+  // and written as uint8_t, which avoids emitting an invalid C++ scalar
+  // literal for these dtypes.
+  if (dtype.is_float8_e4m3fn() || dtype.is_float8_e5m2() ||
+      dtype.is_float4_e2m1fn()) {
+    const std::string target_value = name_supply_->FreshName("__asc_pad_val");
+    PrintIndent();
+    stream << "uint8_t " << target_value << " = 0;\n";
+    PrintIndent();
+    stream << "asc_set_copy_pad_val(*reinterpret_cast<uint8_t*>(&"
+           << target_value << "));\n";
+    return;
+  }
+  const int bit_width = dtype.bits();
   ICHECK(bit_width == 8 || bit_width == 16 || bit_width == 32)
-      << "Data type: " << op->args[0].dtype() << " is not supported in ascend";
+      << "Data type: " << dtype << " is not supported in ascend";
 
   const std::string value = PrintExpr(op->args[0]);
   const std::string target_value = name_supply_->FreshName("__asc_pad_val");
   PrintIndent();
-  PrintType(op->args[0].dtype(), stream);
+  PrintType(dtype, stream);
   stream << " " << target_value << " = " << value << ";\n";
 
   PrintIndent();
