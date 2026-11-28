@@ -62,6 +62,68 @@ def _equal(actual, expected):
         assert analyzer.can_prove_equal(a, b), (a, b)
 
 
+@pytest.mark.parametrize(
+    "dtype,bits",
+    [
+        ("uint8", 8),
+        ("bfloat16", 16),
+        ("int32", 32),
+        ("int64", 64),
+        ("float8_e4m3fn", 8),
+        ("float8_e8m0fnu", 8),
+        ("float4_e2m1fn", 4),
+    ],
+)
+@pytest.mark.parametrize("src_gap,dst_gap", [(1, 0), (0, 2), (1, 2)])
+def test_ub_to_l1_strided_single_dma(dtype, bits, src_gap, dst_gap):
+    block = 256 // bits
+    cols = 2 * block
+    src = tirx.decl_buffer((5, cols + src_gap * block), dtype, name="src", scope="shared.dyn")
+    dst = tirx.decl_buffer((5, cols + dst_gap * block), dtype, name="dst", scope="shared.l1")
+    after = _lower(src, dst, _region(src, (4, cols), (1, 0)), _region(dst, (4, cols), (1, 0)))
+    (copy,) = calls(after, "tl.ascend_copy_ubuf_to_cbuf")
+    _equal(copy.args[2:], (0, 4, 2, src_gap, dst_gap))
+    _equal(copy.args[0].args[2:], ((2 + dst_gap) * block, (8 + 3 * dst_gap) * block, 2))
+    _equal(copy.args[1].args[2:], ((2 + src_gap) * block, (8 + 3 * src_gap) * block, 1))
+
+
+def test_ub_to_l1_contiguous_preserves_dma_arguments():
+    src = tirx.decl_buffer((4, 64), "uint8", scope="shared.dyn")
+    dst = tirx.decl_buffer((4, 64), "uint8", scope="shared.l1")
+    (copy,) = calls(_lower(src, dst), "tl.ascend_copy_ubuf_to_cbuf")
+    _equal(copy.args[2:], (0, 8, 1, 0, 0))
+
+
+@pytest.mark.parametrize(
+    "pitch,cols,start,match",
+    [
+        (96, 48, 0, "segment length"),
+        (80, 64, 0, "source gap"),
+        (96, 64, 1, "source offset"),
+    ],
+)
+def test_ub_to_l1_rejects_unaligned_geometry(pitch, cols, start, match):
+    src = tirx.decl_buffer((4, pitch), "uint8", scope="shared.dyn")
+    dst = tirx.decl_buffer((4, cols), "uint8", scope="shared.l1")
+    with pytest.raises(ValueError, match=match):
+        _lower(src, dst, _region(src, (4, cols), (0, start)))
+
+
+def test_ub_to_l1_strided_rejects_out_of_bounds_final_burst():
+    src = tirx.decl_buffer((4, 96), "uint8", scope="shared.dyn")
+    dst = tirx.decl_buffer((4, 64), "uint8", scope="shared.l1")
+    with pytest.raises(ValueError, match="slice exceeds buffer"):
+        _lower(src, dst, _region(src, (4, 64), (1, 0)))
+
+
+@pytest.mark.parametrize("src_dtype,dst_dtype", [("int8", "uint8"), ("float8_e5m2", "float8_e5m2")])
+def test_ub_to_l1_strided_rejects_unsupported_dtype(src_dtype, dst_dtype):
+    src = tirx.decl_buffer((4, 96), src_dtype, scope="shared.dyn")
+    dst = tirx.decl_buffer((4, 64), dst_dtype, scope="shared.l1")
+    with pytest.raises(ValueError, match="supported matching dtype"):
+        _lower(src, dst, _region(src, (4, 64)))
+
+
 @pytest.mark.parametrize("scope", ["shared.l0a", "shared.l0b"])
 def test_whole_buffer_transpose_preserves_ascend_copy_geometry(scope):
     src = tirx.decl_buffer((32, 16), "bfloat16", name="src", scope="shared.l1")

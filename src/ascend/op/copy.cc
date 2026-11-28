@@ -96,7 +96,8 @@ DataType GetBufferStorageDType(const Buffer &buf) {
 PrimExpr NormalizeFloat4ByteViewPtr(const Buffer &buf,
                                     const PrimExpr &fallback_ptr,
                                     const PrimExpr &logical_offset,
-                                    const PrimExpr &logical_extent) {
+                                    const PrimExpr &logical_extent,
+                                    int rw_mask = 1) {
   DataType storage_dtype = GetBufferStorageDType(buf);
   if (!buf->dtype.is_float4_e2m1fn() || storage_dtype.is_float4_e2m1fn()) {
     return fallback_ptr;
@@ -109,7 +110,7 @@ PrimExpr NormalizeFloat4ByteViewPtr(const Buffer &buf,
               {TypeAnnotation(DataType::Int(8)), buf->data,
                Float4StorageBytes(logical_offset, buf->dtype),
                Float4StorageBytes(logical_extent, buf->dtype),
-               make_const(DataType::Int(32), 1)});
+               make_const(DataType::Int(32), rw_mask)});
 }
 
 // Map float32 source (L0C) + destination dtype → quant_pre hardware mode.
@@ -823,42 +824,115 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     ICHECK_EQ(op.src->dtype.bits(), op.dst->dtype.bits())
         << "Ascend raw UB->L1 copy cannot convert element widths, got source "
         << op.src->dtype << " and destination " << op.dst->dtype << ".";
-    StridedLayout src_layout =
-        StridedLayout::FromBufferRange(op.src, src_range, elem_bits)
-            .Coalesce(analyzer);
-    StridedLayout dst_layout =
-        StridedLayout::FromBufferRange(op.dst, dst_range, op.dst->dtype.bits())
-            .Coalesce(analyzer);
-    ICHECK_EQ(src_layout.modes.size(), 1U)
-        << "Ascend raw UB->L1 copy requires a contiguous source region; got "
-        << src_layout.modes.size() << " modes after coalescing for buffer "
-        << op.src->name << " shape " << op.src->shape << " ranges " << src_range
-        << ". Strided UB->L1 copies are not yet supported.";
-    ICHECK_EQ(dst_layout.modes.size(), 1U)
-        << "Ascend raw UB->L1 copy requires a contiguous destination region; "
-        << "got " << dst_layout.modes.size()
-        << " modes after coalescing for buffer " << op.dst->name << " shape "
-        << op.dst->shape << " ranges " << dst_range
-        << ". Strided UB->L1 copies are not yet supported.";
-    bool element_count_mismatch = analyzer->CanProve(src_layout.modes[0].size !=
-                                                     dst_layout.modes[0].size);
-    ICHECK(!element_count_mismatch)
-        << "Ascend raw UB->L1 copy requires source and destination regions "
-           "with the same element count, got source "
-        << src_layout.modes[0].size << " and destination "
-        << dst_layout.modes[0].size << ".";
-    PrimExpr raw_total_bytes =
-        AscendMTEBytesFromElements(src_layout.modes[0].size, elem_bits);
-    TVM_FFI_CHECK(
-        analyzer->CanProveEqual(FloorMod(raw_total_bytes, I(32)), I(0)),
-        ValueError)
-        << "Ascend raw UB->L1 copy requires a payload that is a multiple of "
-           "32 bytes, but got "
-        << raw_total_bytes << " bytes from source buffer " << op.src->name
-        << " ranges " << src_range << ".";
-    PrimExpr n_burst_val = raw_total_bytes / I(32);
+    auto is_contiguous = [&](const StridedLayout &region) {
+      auto layout = region.Coalesce(analyzer);
+      return layout.modes.size() == 1 &&
+             analyzer->CanProveEqual(layout.modes[0].stride, I(1));
+    };
+    PrimExpr n_burst, burst_len = I(1), src_gap = zero, dst_gap = zero;
+    if (!is_contiguous(src_region) || !is_contiguous(dst_region)) {
+      DataType dtype = op.src->dtype;
+      bool standard_scalar =
+          (elem_bits == 8 || elem_bits == 16 || elem_bits == 32 ||
+           elem_bits == 64) &&
+          (dtype.is_int() || dtype.is_uint() || dtype.is_bfloat16() ||
+           (dtype.is_float() && elem_bits >= 16));
+      TVM_FFI_CHECK(dtype == op.dst->dtype && dtype.lanes() == 1 &&
+                        (standard_scalar || dtype.is_float8_e4m3fn() ||
+                         dtype.is_float8_e8m0fnu() || dtype.is_float4_e2m1fn()),
+                    ValueError)
+          << "Ascend strided UB->L1 requires a supported matching dtype, got "
+          << dtype << " and " << op.dst->dtype;
+
+      With<arith::ConstraintContext> nonempty_copy(analyzer, has_data);
+      MTECopy2D plan = PlanMTECopy(src_region, dst_region, analyzer);
+      auto wide = [](PrimExpr value) { return cast(DataType::Int(64), value); };
+      auto prove = [&](PrimExpr predicate) {
+        return analyzer->CanProve(predicate,
+                                  arith::ProofStrength::kSymbolicBound);
+      };
+      // Prove alignment before division so packed FP4 cannot lose a nibble.
+      auto blocks = [&](PrimExpr elements, const char *field) {
+        PrimExpr bits = analyzer->Simplify(wide(elements) * elem_bits);
+        PrimExpr block_bits = make_const(bits.dtype(), 256);
+        PrimExpr zero_bits = make_zero(bits.dtype());
+        TVM_FFI_CHECK(
+            prove(bits >= zero_bits) &&
+                analyzer->CanProveEqual(FloorMod(bits, block_bits), zero_bits),
+            ValueError)
+            << "Ascend strided UB->L1 " << field
+            << " must be non-negative and 32-byte aligned, got " << elements
+            << " elements";
+        return analyzer->Simplify(FloorDiv(bits, block_bits));
+      };
+      n_burst = plan.n_rows;
+      burst_len = blocks(plan.row_elems, "segment length");
+      TVM_FFI_CHECK(prove(plan.n_rows >= 1 && plan.n_rows <= 4095) &&
+                        prove(burst_len >= 1 && burst_len <= 65535),
+                    ValueError)
+          << "Ascend strided UB->L1 burst count or length exceeds the "
+             "instruction range: "
+          << plan.n_rows << ", " << burst_len;
+
+      auto endpoint = [&](const Buffer &buf, const Array<Range> &ranges,
+                          PrimExpr offset, PrimExpr stride, int rw_mask,
+                          PrimExpr &ptr) {
+        TVM_FFI_CHECK(!FindLayoutForBuffer(T.layout_map, buf).defined(),
+                      ValueError)
+            << "Ascend strided UB->L1 requires a physical buffer view "
+               "without a layout remap: "
+            << buf->name;
+        // With direct physical strides, axis bounds also cover the last burst.
+        for (size_t i = 0; i < ranges.size(); ++i) {
+          const Range &range = ranges[i];
+          TVM_FFI_CHECK(prove(range->min >= 0) &&
+                            prove(wide(range->min) + wide(range->extent) <=
+                                  wide(buf->shape[i])),
+                        ValueError)
+              << "Ascend strided UB->L1 slice exceeds buffer " << buf->name
+              << " on axis " << i;
+        }
+        blocks(offset, rw_mask == 1 ? "source offset" : "destination offset");
+        PrimExpr gap =
+            analyzer->CanProveEqual(plan.n_rows, I(1))
+                ? wide(zero)
+                : blocks(wide(stride) - wide(plan.row_elems),
+                         rw_mask == 1 ? "source gap" : "destination gap");
+        TVM_FFI_CHECK(prove(gap <= 65535), ValueError)
+            << "Ascend strided UB->L1 gap exceeds the instruction range for "
+            << buf->name << ": " << gap;
+        PrimExpr span = analyzer->Simplify(
+            (wide(plan.n_rows) - 1) * wide(stride) + wide(plan.row_elems));
+        ptr = NormalizeFloat4ByteViewPtr(
+            buf, make_access_ptr(buf, ranges, span, rw_mask), wide(offset),
+            span, rw_mask);
+        return gap;
+      };
+      src_gap = endpoint(op.src, src_range, plan.src_offset,
+                         plan.src_stride_elems, 1, src_ptr);
+      dst_gap = endpoint(op.dst, dst_range, plan.dst_offset,
+                         plan.dst_stride_elems, 2, dst_ptr);
+    } else {
+      bool element_count_mismatch =
+          analyzer->CanProve(src_region_elements != dst_region_elements);
+      ICHECK(!element_count_mismatch)
+          << "Ascend raw UB->L1 copy requires source and destination regions "
+             "with the same element count, got source "
+          << src_region_elements << " and destination " << dst_region_elements
+          << ".";
+      PrimExpr raw_total_bytes =
+          AscendMTEBytesFromElements(src_region_elements, elem_bits);
+      TVM_FFI_CHECK(
+          analyzer->CanProveEqual(FloorMod(raw_total_bytes, I(32)), I(0)),
+          ValueError)
+          << "Ascend raw UB->L1 copy requires a payload that is a multiple of "
+             "32 bytes, but got "
+          << raw_total_bytes << " bytes from source buffer " << op.src->name
+          << " ranges " << src_range << ".";
+      n_burst = raw_total_bytes / I(32);
+    }
     call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
-                {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
+                {dst_ptr, src_ptr, sid, n_burst, burst_len, src_gap, dst_gap});
   } else if (dma_path == DMAPath::kL0CToGM) {
     StridedLayout src_layout = NormalizeTrailingMTE2DLayout(
         op.src, src_range, analyzer, "Ascend L0C->GM source");
